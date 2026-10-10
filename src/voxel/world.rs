@@ -313,10 +313,12 @@ pub fn default_palette() -> Vec<Material> {
 }
 
 /// A flat world: layers from the bottom up; the first fills everything below the others.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FlatLayer {
     pub mat: u8,
     pub thickness: i32,
 }
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FlatWorld {
     pub layers: Vec<FlatLayer>,
     pub height: i32,
@@ -478,6 +480,13 @@ impl World {
 
     pub fn next_import_slot(&self) -> usize {
         self.next_import_slot
+    }
+    pub fn set_next_import_slot(&mut self, i: usize) {
+        self.next_import_slot = i.clamp(IMPORT_COLOR_BASE, CUSTOM_COLOR_END);
+    }
+    /// Old saves without the slot: just past the last custom colour in use.
+    pub fn recompute_import_slot(&mut self) {
+        self.next_import_slot = (IMPORT_COLOR_BASE..CUSTOM_COLOR_END).rev().find(|&i| !self.slot_free(i)).map_or(IMPORT_COLOR_BASE, |i| i + 1);
     }
 
     /// How far (x, y, z) is under the water surface above it (voxels; 0 = not in water).

@@ -11,7 +11,6 @@ use crate::gfx::postfx::PostFx;
 use crate::gfx::renderer::record::Rec;
 use crate::gfx::renderer::Renderer;
 use crate::math::{half_to_f32, Vec3};
-use crate::objects::build_self_test_objects;
 use crate::voxel::world::{wm, World};
 
 pub struct ShotArgs {
@@ -22,6 +21,8 @@ pub struct ShotArgs {
     /// final | albedo | normal | motion
     pub dump: String,
     pub validation: bool,
+    /// A save to render instead of a generated world.
+    pub load: Option<String>,
 }
 
 /// Top of the terrain column at (x, z), skipping plants.
@@ -97,11 +98,13 @@ pub fn write_png(path: &str, w: u32, h: u32, rgba: &[u8], bottom_up: bool) -> st
 pub fn run_shot(a: &ShotArgs) -> i32 {
     let (mut ctx, _) = Context::new(&[], a.validation, None);
     let t0 = std::time::Instant::now();
-    let mut world = World::default();
-    world.generate(cvars::WORLD_SEED.get() as u32);
-    let mut objects = build_self_test_objects(&world);
+    let (mut world, mut objects, state) = super::startup_world(a.load.as_deref(), None);
     log::info!(target: "shot", "scene ready in {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
-    let cam = default_camera(&world);
+    let mut cam = default_camera(&world);
+    if let Some(st) = &state {
+        super::saves::restore_state(st, &mut crate::fluid::FluidSim::default(), &mut cam);
+        apply_cam_env(&mut cam, "VF_CAM");
+    }
     let mut r = Renderer::new(&ctx, &mut world, &mut objects, a.w, a.h, a.w, a.h);
     let mut post = PostFx::new(&ctx, &r);
     // Headless edit self-tests (the interactive editor's sync path): VF_CARVETEST=radius carves
@@ -242,8 +245,19 @@ pub fn run_shot(a: &ShotArgs) -> i32 {
         Ok(()) => log::info!(target: "shot", "{} -> {} ({}x{})", a.dump, a.out, img.w(), img.h()),
         Err(e) => log::error!(target: "shot", "writing {}: {e}", a.out),
     }
+    // VF_SAVETEST=name: save the scene as rendered (thumbnail included), for load tests.
+    let mut saved = Ok(());
+    if let Ok(name) = std::env::var("VF_SAVETEST") {
+        let mut cam = cam;
+        let mut fluid = crate::fluid::FluidSim::default();
+        let mut io = super::saves::WorldIo { ctx: &ctx, r: &mut r, world: &mut world, objects: &mut objects, cam: &mut cam, fluid: &mut fluid };
+        saved = super::saves::save_world(&mut io, &name).map(|_| ());
+        if let Err(e) = &saved {
+            log::error!(target: "shot", "saving {name}: {e}");
+        }
+    }
     post.destroy(&ctx);
     r.destroy(&ctx);
     ctx.destroy();
-    if ok.is_ok() { 0 } else { 1 }
+    if ok.is_ok() && saved.is_ok() { 0 } else { 1 }
 }

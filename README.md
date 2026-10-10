@@ -38,20 +38,22 @@ Linux windows also need `libxkbcommon-x11` (installed on every desktop).
 ## Running
 
 ```
-voxelforge [--winsize WxH] [--validation] [+set <cvar> <value>] [+exec "cmd"]
+voxelforge [--winsize WxH] [--validation] [--load <world>] [+set <cvar> <value>] [+exec "cmd"]
            [--shot out.png [--frames N] [--dump final|albedo|normal|motion]]
 ```
 
-Window keys: click to capture the mouse (Esc frees it, Esc again quits), WASD to walk
-(Shift sprint, Ctrl / C crouch, Space jump, double-tap Space to fly / land; flying: Space / Ctrl
-up / down, wheel = speed), Tab toggles the free camera (no collision), LMB carve / RMB place a sphere (`-` / `=` size, 1-9
-material), F3 stats in the title, F4 debug views, F6 render scale, F10 reload shaders,
-F11 fullscreen, P pause physics, L ray traced / Standard lighting, N SVGF / raw, `[` `]` exposure.
+Window keys: click to capture the mouse (Esc frees it, Esc again quits), WASD to walk (Shift
+sprint, Ctrl / C crouch, Space jump, double-tap Space to fly / land; flying: Space / Ctrl up /
+down, wheel = speed), Tab toggles the free camera (no collision), LMB carve / RMB place a
+sphere (`-` / `=` size, 1-9 material), F3 stats in the title, F4 debug views, F6 render scale,
+F10 reload shaders, F5 / F9 quick save / load, F11 fullscreen, P pause physics, L ray traced /
+Standard lighting, N SVGF / raw, `[` `]` exposure.
 
 Every setting is a console variable (`src/cvars.rs`): `+set r.lighting standard`,
-`VF_SET="r.fog.density=2;r.clouds.coverage=0.7"`, or `settings.cfg` next to the game.
-`--shot` renders headless (no window) and writes a PNG; `VF_CAM="x,y,z,yaw,pitch"` places
-its camera.
+`VF_SET="r.fog.density=2;r.clouds.coverage=0.7"`, or `settings.cfg` next to the game. `--shot`
+renders headless (no window) and writes a PNG; `VF_CAM="x,y,z,yaw,pitch"` places its camera.
+`--load <world>` starts in a save (a path, or a world's name in `saves/`), in the window or a
+shot.
 
 ## What changed from the C++ engine
 
@@ -64,6 +66,9 @@ its camera.
   buffer.
 - **Lock-free settings**: cvars are statics with atomic values; the renderer reads them every
   frame without string lookups or locks.
+- **Faster saves**: the payload streams through the compressors in 4 MB chunks (a few chunks
+  in memory instead of the whole 200 MB payload) at zlib level 2: a generated world saves in
+  ~0.4 s instead of ~1.5 s, ~30 % larger, still readable by the C++ engine.
 - **rayon** work-stealing replaces the hand-rolled job pool (chunk generation, the atlas
   packing, the light scan).
 - std140 / push-constant layouts are mirrored as `#[repr(C)]` structs with compile-time
@@ -81,12 +86,13 @@ physics (voxel-shell contacts, warm-started sequential impulses with friction, s
 felled-tree hinges; fixed 60 Hz with interpolated rendering), destruction (carved-loose pieces
 become bodies, a cut tree takes its own crown and topples toward the cut; bodies split), water
 flow (a volume-conserving cellular fluid: water falls, spreads, refills from its body's surface
-and drains lakes level).
+and drains lakes level), saves (the C++ engine's `.vfworld` format, v1-v6, written as v6; quick
+save / load with thumbnails).
 
-Not yet ported: generators 2 / 3, endless streaming (`StreamManager`, far horizon), saves /
-region files, the undo stack and edit tools (shapes, lines, brush tools), the ImGui UI (menus,
-editor, map, inventory), audio, weather presets, mesh import, NVIDIA DLSS / NRD and hardware
-ray queries.
+Not yet ported: generators 2 / 3, endless streaming (`StreamManager`, far horizon), region
+files, the undo stack and edit tools (shapes, lines, brush tools), the ImGui UI (menus, editor,
+map, inventory), audio, weather presets, mesh import, NVIDIA DLSS / NRD and hardware ray
+queries.
 
 ## Debugging
 

@@ -25,8 +25,10 @@ use crate::gfx::postfx::PostFx;
 use crate::gfx::renderer::record::Rec;
 use crate::gfx::renderer::Renderer;
 use crate::math::Vec3;
-use crate::objects::{build_self_test_objects, VoxObject};
+use crate::objects::VoxObject;
 use crate::fluid::FluidSim;
+use crate::serialize::SceneState;
+use super::saves;
 use crate::physics::{self, BodyState, Physics};
 use crate::player::{self as pl, Player, PlayerInput, PlayerTuning, PlayerWorld};
 use crate::voxel::world::{wm, World};
@@ -55,6 +57,8 @@ struct Game {
     title_at: Instant,
     brush_radius: f32,
     place_mat: u8,
+    /// A status line shown in the title for a few seconds (saves, errors).
+    notice: Option<(String, Instant)>,
     player: Player,
     /// Where the player put the eye last frame: anything else moving the camera hands it over.
     last_eye: Vec3,
@@ -74,8 +78,11 @@ struct Game {
     fluid_synced: Instant,
 }
 
+/// What the loading worker hands over.
+type StartupWorld = (World, Vec<VoxObject>, Option<SceneState>);
+
 enum Phase {
-    Loading { thread: Option<std::thread::JoinHandle<(World, Vec<VoxObject>)>>, progress: Arc<AtomicI32> },
+    Loading { thread: Option<std::thread::JoinHandle<StartupWorld>>, progress: Arc<AtomicI32> },
     Game(Box<Game>),
 }
 
@@ -96,11 +103,12 @@ struct App {
     validation: bool,
     size: (u32, u32),
     frame_limit: u32,
+    load: Option<String>,
     run: Option<Running>,
     exit_code: i32,
 }
 
-pub fn run(validation: bool, w: u32, h: u32, frames: u32) -> i32 {
+pub fn run(validation: bool, w: u32, h: u32, frames: u32, load: Option<String>) -> i32 {
     let el = match EventLoop::new() {
         Ok(e) => e,
         Err(e) => {
@@ -109,7 +117,7 @@ pub fn run(validation: bool, w: u32, h: u32, frames: u32) -> i32 {
         }
     };
     el.set_control_flow(ControlFlow::Poll);
-    let mut app = App { validation, size: (w, h), frame_limit: frames, run: None, exit_code: 0 };
+    let mut app = App { validation, size: (w, h), frame_limit: frames, load, run: None, exit_code: 0 };
     if let Err(e) = el.run_app(&mut app) {
         log::error!(target: "app", "event loop: {e}");
         return 1;
@@ -149,17 +157,11 @@ impl ApplicationHandler for App {
         let acquire = [ctx.create_semaphore(), ctx.create_semaphore()];
         let fences = [ctx.create_fence(true), ctx.create_fence(true)];
         let cmds = [ctx.alloc_cmd(), ctx.alloc_cmd()];
-        // The world generates on a worker while the window shows progress.
+        // The world generates (or loads) on a worker while the window shows progress.
         let progress = Arc::new(AtomicI32::new(0));
         let p2 = progress.clone();
-        let thread = std::thread::spawn(move || {
-            let mut world = World::default();
-            world.gen_progress = Some(p2);
-            world.generate(cvars::WORLD_SEED.get() as u32);
-            world.gen_progress = None;
-            let objects = build_self_test_objects(&world);
-            (world, objects)
-        });
+        let load = self.load.take();
+        let thread = std::thread::spawn(move || super::startup_world(load.as_deref(), Some(p2)));
         self.run = Some(Running {
             window,
             ctx,
@@ -182,12 +184,11 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => {
                 if !run.frame() {
                     el.exit();
-                } else if self.frame_limit > 0 {
-                    if let Phase::Game(g) = &run.phase {
-                        if g.frame >= self.frame_limit {
-                            el.exit();
-                        }
-                    }
+                } else if let Phase::Game(g) = &run.phase
+                    && self.frame_limit > 0
+                    && g.frame >= self.frame_limit
+                {
+                    el.exit();
                 }
             }
             WindowEvent::Focused(false) => run.set_captured(false),
@@ -218,14 +219,13 @@ impl ApplicationHandler for App {
     }
 
     fn device_event(&mut self, _el: &ActiveEventLoop, _id: DeviceId, ev: DeviceEvent) {
-        if let (Some(run), DeviceEvent::MouseMotion { delta }) = (self.run.as_mut(), ev) {
-            if let Phase::Game(g) = &mut run.phase {
-                if g.captured {
-                    let s = cvars::IN_SENSITIVITY.get();
-                    let dy = if cvars::IN_INVERT_Y.get() { -delta.1 } else { delta.1 };
-                    g.cam.look(delta.0 as f32 * s, dy as f32 * s);
-                }
-            }
+        if let (Some(run), DeviceEvent::MouseMotion { delta }) = (self.run.as_mut(), ev)
+            && let Phase::Game(g) = &mut run.phase
+            && g.captured
+        {
+            let s = cvars::IN_SENSITIVITY.get();
+            let dy = if cvars::IN_INVERT_Y.get() { -delta.1 } else { delta.1 };
+            g.cam.look(delta.0 as f32 * s, dy as f32 * s);
         }
     }
 
@@ -260,6 +260,35 @@ fn tuning() -> PlayerTuning {
 }
 
 impl Game {
+    fn notify(&mut self, msg: String) {
+        log::info!(target: "app", "{msg}");
+        self.notice = Some((msg, Instant::now()));
+        self.title_at = Instant::now() - std::time::Duration::from_secs(1); // refresh the title now
+    }
+
+    /// F5 / F9.
+    fn quick_save_load(&mut self, ctx: &Context, save: bool) {
+        let mut io = saves::WorldIo { ctx, r: &mut self.r, world: &mut self.world, objects: &mut self.objects, cam: &mut self.cam, fluid: &mut self.fluid };
+        let msg = if save {
+            match saves::quick_save(&mut io) {
+                Ok(n) => format!("World saved: {n}"),
+                Err(e) => format!("Couldn't save: {e}"),
+            }
+        } else {
+            match saves::quick_load(&mut io) {
+                Ok(n) => {
+                    // A new scene: no history to blend from.
+                    self.prev_cam = self.cam;
+                    self.phys_prev.clear();
+                    self.fluid_dirty = false;
+                    format!("Loaded {n}")
+                }
+                Err(e) => format!("Couldn't load: {e}"),
+            }
+        };
+        self.notify(msg);
+    }
+
     /// Fixed-step physics; the GPU gets the bodies interpolated between the last two steps.
     fn simulate(&mut self, ctx: &Context, dt: f32) {
         let on = cvars::GAME_PHYSICS.get();
@@ -416,6 +445,10 @@ impl Running {
                 cvars::R_SCALE.set(RENDER_SCALES[i]);
                 self.need_resize = true;
             }
+            KeyCode::F5 | KeyCode::F9 => {
+                let Phase::Game(g) = &mut self.phase else { return };
+                g.quick_save_load(&self.ctx, code == KeyCode::F5);
+            }
             KeyCode::F10 => {
                 let Phase::Game(g) = &mut self.phase else { return };
                 g.r.reload_shaders(&self.ctx);
@@ -555,11 +588,15 @@ impl Running {
         // Loading: finish the world when the worker is done (then build the renderer).
         if let Phase::Loading { thread, progress } = &mut self.phase {
             if thread.as_ref().is_some_and(|t| t.is_finished()) {
-                let (mut world, mut objects) = thread.take().unwrap().join().expect("world generation panicked");
+                let (mut world, mut objects, state) = thread.take().unwrap().join().expect("world generation panicked");
                 let (rw, rh) = self.render_size();
                 let r = Renderer::new(&self.ctx, &mut world, &mut objects, rw, rh, rw, rh);
                 let post = PostFx::new(&self.ctx, &r);
-                let cam = default_camera(&world);
+                let mut cam = default_camera(&world);
+                let mut fluid = FluidSim::default();
+                if let Some(st) = &state {
+                    saves::restore_state(st, &mut fluid, &mut cam);
+                }
                 let now = Instant::now();
                 self.phase = Phase::Game(Box::new(Game {
                     world,
@@ -577,6 +614,7 @@ impl Running {
                     title_at: now,
                     brush_radius: 6.0,
                     place_mat: wm::STONE,
+                    notice: None,
                     player: Player::default(),
                     // Differs from the camera: the first frame places the player under it.
                     last_eye: cam.pos + Vec3::splat(1e6),
@@ -586,7 +624,7 @@ impl Running {
                     phys_acc: 0.0,
                     phys_prev: Vec::new(),
                     phys_was_on: false,
-                    fluid: FluidSim::default(),
+                    fluid,
                     fluid_dirty: false,
                     fluid_synced: now,
                 }));
@@ -776,6 +814,13 @@ impl Running {
                           g.brush_radius, g.place_mat);
             let top: Vec<String> = g.r.pass_ms.iter().map(|(n, ms)| format!("{n} {ms:.2}")).collect();
             t += &format!("  [{}]", top.join(", "));
+        }
+        if let Some((msg, at)) = &g.notice {
+            if at.elapsed().as_secs_f32() < 4.0 {
+                t = format!("{msg}  |  {t}");
+            } else {
+                g.notice = None;
+            }
         }
         self.window.set_title(&t);
     }

@@ -1538,6 +1538,7 @@ dependencies = [
  "ash",
  "ash-window",
  "bytemuck",
+ "flate2",
  "glam",
  "gpu-allocator",
  "log",
