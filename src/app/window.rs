@@ -858,6 +858,7 @@ impl Running {
         let r = &mut g.r;
         r.update_lights(&g.world, &g.objects, g.cam.pos, time);
         r.set_frame_uniforms(&g.cam, &g.prev_cam, g.frame, exposure, time, [0.0, 0.0]);
+        r.update_rt(&self.ctx, &g.world);
         r.update_sets(&self.ctx, slot);
         let cb = self.cmds[slot];
         vkc(unsafe { dev.reset_command_buffer(cb, vk::CommandBufferResetFlags::empty()) }, "reset cmd");

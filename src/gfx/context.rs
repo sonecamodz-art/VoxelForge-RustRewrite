@@ -37,6 +37,12 @@ pub struct Context {
     pub surface_fn: Option<khr::surface::Instance>,
     pub swapchain_fn: Option<khr::swapchain::Device>,
     pub validation: bool,
+    /// Hardware ray queries (VK_KHR_ray_query + acceleration structures) are enabled: the
+    /// device has them and VF_NO_RT isn't set. `accel` is their entry points.
+    pub ray_query: bool,
+    pub accel: Option<khr::acceleration_structure::Device>,
+    /// minAccelerationStructureScratchOffsetAlignment.
+    pub as_scratch_align: u64,
 }
 
 unsafe extern "system" fn debug_cb(
@@ -80,6 +86,13 @@ impl Context {
         let avail_exts = unsafe { entry.enumerate_instance_extension_properties(None) }.unwrap_or_default();
         let has_ext = |n: &CStr| avail_exts.iter().any(|e| e.extension_name_as_c_str() == Ok(n));
         let mut exts: Vec<*const c_char> = instance_exts.to_vec();
+        // NVIDIA NGX (DLSS) needs some of its own, before the device exists.
+        let (ngx_inst, ngx_dev) = crate::gfx::dlss::required_extensions();
+        for e in &ngx_inst {
+            if has_ext(e) && !exts.iter().any(|&p| unsafe { CStr::from_ptr(p) } == e.as_c_str()) {
+                exts.push(e.as_ptr());
+            }
+        }
         let debug_utils = has_ext(ext::debug_utils::NAME);
         if debug_utils {
             exts.push(ext::debug_utils::NAME.as_ptr());
@@ -142,14 +155,50 @@ impl Context {
         if surface_fn.is_some() {
             dev_exts.push(khr::swapchain::NAME.as_ptr());
         }
+        let avail_dev = unsafe { instance.enumerate_device_extension_properties(phys) }.unwrap_or_default();
+        let has_dev = |n: &CStr| avail_dev.iter().any(|e| e.extension_name_as_c_str() == Ok(n));
+        for e in &ngx_dev {
+            if has_dev(e) && !dev_exts.iter().any(|&p| unsafe { CStr::from_ptr(p) } == e.as_c_str()) {
+                dev_exts.push(e.as_ptr());
+            }
+        }
+        // Hardware ray queries (optional; gfx::rt): acceleration structures + ray queries in compute.
+        let no_rt = std::env::var("VF_NO_RT").is_ok_and(|v| !v.is_empty() && v != "0");
+        let mut ray_query = !no_rt
+            && has_dev(khr::acceleration_structure::NAME)
+            && has_dev(khr::ray_query::NAME)
+            && has_dev(khr::deferred_host_operations::NAME);
+        if ray_query {
+            let mut qa = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default();
+            let mut qr = vk::PhysicalDeviceRayQueryFeaturesKHR::default();
+            let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut qa).push_next(&mut qr);
+            unsafe { instance.get_physical_device_features2(phys, &mut f2) };
+            ray_query = qa.acceleration_structure == vk::TRUE && qr.ray_query == vk::TRUE;
+        }
+        let mut as_scratch_align = 256;
+        if ray_query {
+            for e in [khr::acceleration_structure::NAME, khr::ray_query::NAME, khr::deferred_host_operations::NAME] {
+                dev_exts.push(e.as_ptr());
+            }
+            let mut asp = vk::PhysicalDeviceAccelerationStructurePropertiesKHR::default();
+            let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut asp);
+            unsafe { instance.get_physical_device_properties2(phys, &mut p2) };
+            as_scratch_align = (asp.min_acceleration_structure_scratch_offset_alignment as u64).max(1);
+        }
         let mut f13 = vk::PhysicalDeviceVulkan13Features::default()
             .synchronization2(true)
             .dynamic_rendering(true)
             .robust_image_access(std::env::var("VF_ROBUST").is_ok());
-        let mut f12 = vk::PhysicalDeviceVulkan12Features::default();
+        // (buffer device addresses: core in 1.3; the acceleration structures are fed by address)
+        let mut f12 = vk::PhysicalDeviceVulkan12Features::default().buffer_device_address(true);
+        let mut f_as = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default().acceleration_structure(true);
+        let mut f_rq = vk::PhysicalDeviceRayQueryFeaturesKHR::default().ray_query(true);
         // VF_ROBUST=1: bounds-checked buffer access (debugging out-of-range shader reads).
         let f10 = vk::PhysicalDeviceFeatures::default().robust_buffer_access(std::env::var("VF_ROBUST").is_ok());
         let mut feats = vk::PhysicalDeviceFeatures2::default().features(f10).push_next(&mut f12).push_next(&mut f13);
+        if ray_query {
+            feats = feats.push_next(&mut f_as).push_next(&mut f_rq);
+        }
         let dci = vk::DeviceCreateInfo::default().queue_create_infos(&qci).enabled_extension_names(&dev_exts).push_next(&mut feats);
         let device = vkc(unsafe { instance.create_device(phys, &dci, None) }, "vkCreateDevice");
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
@@ -169,12 +218,14 @@ impl Context {
             device: device.clone(),
             physical_device: phys,
             debug_settings: Default::default(),
-            buffer_device_address: false,
+            buffer_device_address: true,
             allocation_sizes: Default::default(),
         })
         .unwrap_or_else(|e| crate::log::fatal("vk", &format!("allocator: {e}")));
         let swapchain_fn = surface_fn.as_ref().map(|_| khr::swapchain::Device::new(&instance, &device));
         let debug_device = debug.as_ref().map(|_| ext::debug_utils::Device::new(&instance, &device));
+        let accel = ray_query.then(|| khr::acceleration_structure::Device::new(&instance, &device));
+        log::info!(target: "vk", "hardware ray queries: {}", if ray_query { "available" } else if no_rt { "off (VF_NO_RT)" } else { "not supported" });
         (
             Self {
                 entry,
@@ -191,9 +242,17 @@ impl Context {
                 surface_fn,
                 swapchain_fn,
                 validation,
+                ray_query,
+                accel,
+                as_scratch_align,
             },
             surface,
         )
+    }
+
+    /// A buffer's GPU address (it was made with SHADER_DEVICE_ADDRESS).
+    pub fn buffer_address(&self, buf: vk::Buffer) -> u64 {
+        unsafe { self.device.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buf)) }
     }
 
     pub fn device_name(&self) -> String {

@@ -22,6 +22,14 @@ rayon = "1.12"
 shaderc = "0.8"
 winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }
 
+[features]
+# NVIDIA DLSS (Ray Reconstruction, Super Resolution / DLAA): needs the DLSS SDK
+# (git clone https://github.com/NVIDIA/DLSS) in external/DLSS or at VF_DLSS_SDK.
+dlss = []
+# NVIDIA NRD (REBLUR + SIGMA denoisers): needs NRD v4.17 (git clone --branch v4.17.3
+# https://github.com/NVIDIA-RTX/NRD) in external/NRD or at VF_NRD_SDK; built with CMake.
+nrd = []
+
 [profile.dev]
 opt-level = 1
 

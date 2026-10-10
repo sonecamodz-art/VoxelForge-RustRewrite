@@ -79,6 +79,14 @@ impl Renderer {
         pass_barrier(&r.ctx.device, r.cb);
     }
 
+    /// Ray queries: this frame's TLAS, before any pass traces.
+    fn record_rt_tlas(&mut self, r: &Rec) {
+        if self.gpu.rt.active() {
+            self.gpu.rt.record_tlas(r.ctx, r.cb);
+            self.stamp(r, "tlas");
+        }
+    }
+
     // --- GPU timers ----------------------------------------------------------------------------
     pub fn begin_timers(&mut self, r: &Rec) {
         let sl = &mut self.slots[self.cur];
@@ -313,6 +321,7 @@ impl Renderer {
         let (gx, gy) = (self.w.div_ceil(8), self.h.div_ceil(8));
         let (hx, hy) = (self.hw.div_ceil(8), self.hh.div_ceil(8));
         self.begin_timers(r);
+        self.record_rt_tlas(r);
         self.record_grass_wind(r);
         self.record_gi_cache(r);
         self.go(r, P::Gbuf, self.set(S::Gbuf), gx, gy, 1, "gbuffer");
@@ -390,6 +399,7 @@ impl Renderer {
     pub fn record_raw(&mut self, r: &Rec) {
         let (gx, gy) = (self.w.div_ceil(8), self.h.div_ceil(8));
         self.begin_timers(r);
+        self.record_rt_tlas(r);
         self.record_grass_wind(r);
         self.record_gi_cache(r);
         self.go(r, P::Gbuf, self.set(S::Gbuf), gx, gy, 1, "gbuffer");
@@ -421,6 +431,7 @@ impl Renderer {
         let (gx, gy) = (self.w.div_ceil(8), self.h.div_ceil(8));
         let dev = &r.ctx.device;
         self.begin_timers(r);
+        self.record_rt_tlas(r);
         self.record_grass_wind(r);
         self.go(r, P::Gbuf, self.set(S::Gbuf), gx, gy, 1, "gbuffer");
         self.barrier(r);

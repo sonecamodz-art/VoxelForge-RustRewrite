@@ -15,6 +15,7 @@ use gpu_allocator::MemoryLocation;
 use rayon::prelude::*;
 
 use super::context::{image_barrier, memory_barrier, to_general, vkc, Access, Buffer, Context, Image, Stage, COLOR_LAYERS};
+use super::rt::RtScene;
 use super::shader::{self, ComputePipeline};
 use crate::objects::VoxObject;
 use crate::voxel::sparse_volume::{brick_mask, Brick, RING_CHUNK_B};
@@ -162,6 +163,11 @@ pub struct GpuWorld {
     pub chunk_events: Vec<(i32, i32)>,
     /// Grid cells synced since the light registry last rescanned.
     pub synced_grid: Vec<u32>,
+
+    /// Hardware ray queries: the acceleration structures, built with the world while
+    /// `rt_wanted` (the renderer: r.rt.*) and kept in step with its syncs.
+    pub rt: RtScene,
+    pub rt_wanted: bool,
 }
 
 impl GpuWorld {
@@ -428,6 +434,7 @@ impl GpuWorld {
         }
         log::info!(target: "vk", "world upload: pack {:.0} ms, create {:.0}, total {:.0} ms", t_pack.as_secs_f64() * 1e3,
                    (t_create - t_pack).as_secs_f64() * 1e3, t0.elapsed().as_secs_f64() * 1e3);
+        self.rt_rebuild(ctx, world);
         world.dirty_grid.clear();
         for o in objects.iter_mut() {
             o.vol.dirty_grid.clear();
@@ -792,7 +799,7 @@ impl GpuWorld {
     pub fn stage(&mut self, ctx: &Context, data: &[u8]) -> (vk::Buffer, u64) {
         let size = data.len() as u64;
         if self.ring.is_null() {
-            self.ring = ctx.create_buffer("stagingRing", RING_SIZE, vk::BufferUsageFlags::TRANSFER_SRC, MemoryLocation::CpuToGpu);
+            self.ring = ctx.create_buffer("stagingRing", RING_SIZE, Self::staging_usage(ctx), MemoryLocation::CpuToGpu);
             self.ring_head = 0;
             self.ring_tail = 0;
         }
@@ -832,10 +839,54 @@ impl GpuWorld {
                 self.retire_oldest(ctx);
             }
         }
-        let t = ctx.upload_buffer("stagingTemp", data, vk::BufferUsageFlags::TRANSFER_SRC);
+        let t = ctx.upload_buffer("stagingTemp", data, Self::staging_usage(ctx));
         let b = t.buf;
         self.sync_temps.push(t);
         (b, 0)
+    }
+
+    /// Staging memory also feeds acceleration-structure builds (read by address).
+    fn staging_usage(ctx: &Context) -> vk::BufferUsageFlags {
+        let mut u = vk::BufferUsageFlags::TRANSFER_SRC;
+        if ctx.ray_query {
+            u |= vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
+        }
+        u
+    }
+
+    /// Record the BLAS builds of these ring / bounded tiles into the open sync `cb`, their
+    /// input staged with this sync.
+    fn rt_build_tiles(&mut self, ctx: &Context, cb: vk::CommandBuffer, world: &World, tiles: &[usize]) {
+        let mut rt = std::mem::take(&mut self.rt);
+        rt.build_tiles(ctx, cb, world, &world.palette, tiles, &mut |d| {
+            let (b, off) = self.stage(ctx, d);
+            (b, off, ctx.buffer_address(b) + off)
+        });
+        self.rt = rt;
+    }
+
+    /// Make (rt_wanted) or drop the acceleration structures for the whole world; waits.
+    pub fn rt_rebuild(&mut self, ctx: &Context, world: &World) {
+        if !(self.rt_wanted && ctx.ray_query) {
+            self.rt.destroy(ctx);
+            return;
+        }
+        let t0 = std::time::Instant::now();
+        self.rt.init(ctx, self.wbx, self.wby, self.wbz, if self.ring_mode { world.ring_w } else { 0 });
+        let mut temps: Vec<Buffer> = Vec::new();
+        let cb = ctx.begin_one_shot();
+        self.rt.build_all(ctx, cb, world, &world.palette, &mut |d| {
+            let t = ctx.upload_buffer("rtBuildInput", d, Self::staging_usage(ctx));
+            let r = (t.buf, 0, ctx.buffer_address(t.buf));
+            temps.push(t);
+            r
+        });
+        ctx.end_one_shot_and_wait(cb);
+        for t in &mut temps {
+            t.destroy(ctx);
+        }
+        log::info!(target: "rt", "acceleration structures: {} tiles, {} bricks, {:.0} MB, in {:.0} ms", self.rt.built_tiles(), self.rt.primitives(),
+                   self.rt.memory_bytes() as f64 / 1048576.0, t0.elapsed().as_secs_f64() * 1e3);
     }
 
     /// Finished syncs, oldest first: their resources freed, the ring's tail moved past them.
@@ -1080,6 +1131,11 @@ impl GpuWorld {
             self.record_distance_field(ctx, cb, lo, hi, x.lo, x.hi);
         }
         self.edit_counter += 1;
+        if self.rt.active() {
+            // the edited tiles' BLAS
+            let tiles: Vec<usize> = dirty.iter().map(|&gi| self.rt.tile_of_cell(gi)).collect();
+            self.rt_build_tiles(ctx, cb, world, &tiles);
+        }
         self.submit_sync(ctx, cb);
         log::trace!(target: "gpu-world", "sync: {} cells, {} bricks, {} compacted so far", dirty.len(), up.len(), self.bricks_compacted);
         self.synced_grid.extend_from_slice(&dirty);
@@ -1304,6 +1360,11 @@ impl GpuWorld {
             self.edit_boxes.push([b.lo[0] * 8, 0, b.lo[2] * 8, b.hi[0] * 8 + 8, self.wby * 8, b.hi[2] * 8 + 8]);
         }
         self.edit_counter += 1;
+        if self.rt.active() {
+            // the slots that changed: their chunk's BLAS, or none
+            let tiles: Vec<usize> = loaded.iter().chain(evicted).map(|&(cx, cz)| self.rt.tile_of_chunk(cx, cz)).collect();
+            self.rt_build_tiles(ctx, cb, world, &tiles);
+        }
         self.submit_sync(ctx, cb);
         log::trace!(target: "gpu-world", "chunks: {} in, {} out, {} bricks, atlas {} / {}", loaded.len(), evicted.len(), up.len(),
                     self.atlas_slots, self.atlas_capacity());
@@ -1405,6 +1466,7 @@ impl GpuWorld {
 
     pub fn destroy(&mut self, ctx: &Context) {
         self.retire_syncs(ctx, true);
+        self.rt.destroy(ctx);
         let dev = &ctx.device;
         unsafe {
             for f in self.free_fences.drain(..) {

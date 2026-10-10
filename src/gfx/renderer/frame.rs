@@ -648,6 +648,7 @@ impl Renderer {
         self.origin_shift[0] += dx as f32;
         self.origin_shift[1] += dz as f32;
         self.lights.shift(dx as f32, dz as f32);
+        self.gpu.rt.shift(dx, dz);
         self.reset_lamp_cache();
         let st = &mut self.std;
         st.valid = false;

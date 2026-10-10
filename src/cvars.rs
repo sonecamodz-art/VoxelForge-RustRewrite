@@ -35,9 +35,48 @@ cvars! {
     R_EXPOSURE: Float = Float::new("r.exposure", 0.8, "manual exposure ([ and ] keys)", 0.05, 4.0);
     R_PRESENT: Str = Str::new("r.present", "fifo", "present mode: fifo = v-sync, mailbox = low latency, immediate = uncapped (V)",
                               &["fifo", "mailbox", "immediate"]);
-    R_SCALE: Float = Float::new("r.scale", 1.0, "render scale (F6 cycles 1/0.75/0.6/0.5); the blit upscales", 0.25, 1.0);
-    R_DENOISER: Str = Str::new("r.denoiser", "svgf", "svgf = in-house SVGF chain, none = raw 1-spp radiance (N cycles)",
-                               &["svgf", "none"]);
+    R_SCALE: Float = Float::new("r.scale", 1.0, "render scale without DLSS (r.aa off; F6 cycles 1/0.75/0.6/0.5); with DLSS the DLSS mode sets it (F8)", 0.25, 1.0);
+    R_DENOISER: Str = Str::new("r.denoiser", "rr",
+                               "rr = DLSS Ray Reconstruction, svgf = in-house SVGF, nrd = NVIDIA NRD (REBLUR + SIGMA), none = raw 1-spp radiance (N cycles; \
+                                what isn't available falls back to svgf)",
+                               &["rr", "svgf", "nrd", "none"]);
+    // ---- NVIDIA DLSS (gfx::dlss; built with --features dlss) ------------------------------
+    R_DLSS_QUALITY: Int = Int::new("r.dlss.quality", 0, "DLSS mode = render resolution before DLSS upscales (Ray Reconstruction and, with r.aa dlaa, \
+                                   every other path): 0 DLAA (native), 1 Quality, 2 Balanced, 3 Performance, 4 Ultra Performance (F8)", 0, 4);
+    R_AA: Str = Str::new("r.aa", "dlaa", "anti-aliasing of the SVGF / NRD / Standard image: off | dlaa (DLSS Super Resolution; upscales with r.dlss.quality > 0)",
+                         &["off", "dlaa"]);
+    R_AA_JITTER_SX: Float = Float::new("r.aa.jitter.sx", -1.0, "jitter X multiplier sent to NGX (sign convention)", -1.0, 1.0);
+    R_AA_JITTER_SY: Float = Float::new("r.aa.jitter.sy", -1.0, "jitter Y multiplier sent to NGX (sign convention)", -1.0, 1.0);
+    R_RR_JITTER: Bool = Bool::new("r.rr.jitter", true, "sub-pixel jitter in the RR path (needed for a clean still image)");
+    // ---- NVIDIA NRD (gfx::nrd; built with --features nrd) ---------------------------------
+    R_NRD_FRAMES: Int = Int::new("r.nrd.frames", 30, "NRD REBLUR: frames of history at most (accumulation)", 0, 63);
+    R_NRD_FAST: Int = Int::new("r.nrd.fast", 6, "NRD REBLUR: frames of the fast history (anti-lag clamp)", 0, 63);
+    R_NRD_STAB: Int = Int::new("r.nrd.stab", 63, "NRD REBLUR: frames of the stabilised (luma) history, 0 = off", 0, 63);
+    R_NRD_PREPASS: Float = Float::new("r.nrd.prepass", 0.0, "NRD REBLUR: pre-pass blur radius (pixels), 0 = off", 0.0, 100.0);
+    R_NRD_BLUR: Float = Float::new("r.nrd.blur", 5.0, "NRD REBLUR: base (max) blur radius (pixels)", 0.0, 100.0);
+    R_NRD_BLUR_MIN: Float = Float::new("r.nrd.blur.min", 0.0, "NRD REBLUR: blur radius once converged (pixels)", 0.0, 20.0);
+    R_NRD_HIT_A: Float = Float::new("r.nrd.hit.a", 30.0, "NRD REBLUR hit-distance normalisation A (voxels; NRD's 3 m)", 0.1, 1000.0);
+    R_NRD_HIT_B: Float = Float::new("r.nrd.hit.b", 0.1, "NRD REBLUR hit-distance normalisation B (per unit of view z)", 0.001, 10.0);
+    R_NRD_HIT_C: Float = Float::new("r.nrd.hit.c", 20.0, "NRD REBLUR hit-distance normalisation C (roughness scale)", 1.0, 100.0);
+    R_NRD_CLAMP: Float = Float::new("r.nrd.clamp", 2.0, "NRD REBLUR: fast-history clamp (sigma scale)", 1.0, 3.0);
+    R_NRD_FIREFLY: Bool = Bool::new("r.nrd.firefly", true, "NRD REBLUR: anti-firefly");
+    R_NRD_PLANE: Float = Float::new("r.nrd.plane", 0.02, "NRD REBLUR / SIGMA: plane distance sensitivity", 0.001, 0.2);
+    R_NRD_DISOCC: Float = Float::new("r.nrd.disocc", 0.01, "NRD: disocclusion threshold (relative)", 0.005, 0.05);
+    R_NRD_SUN_STAB: Int = Int::new("r.nrd.sun.stab", 5, "NRD SIGMA: frames of temporal stabilisation, 0 = off", 0, 63);
+    R_NRD_BYPASS: Int = Int::new("r.nrd.bypass", 0, "NRD: shade raw noisy signals instead of denoised ones - 1 bounce light, 2 sun, 3 both", 0, 3);
+    R_NRD_SIGMA: Bool = Bool::new("r.nrd.sigma", false, "NRD: also denoise the sun with SIGMA (off: the sun is its own, already clean signal)");
+    R_NRD_DEBUG: Bool = Bool::new("r.nrd.debug", false, "NRD: its validation overlay (history, disocclusions, guides)");
+    // ---- hardware ray queries (gfx::rt) ---------------------------------------------------
+    R_RT: Bool = Bool::new("r.rt", true, "hardware ray queries (RT cores) for the ray types r.rt.* turn on (0: the DDA everywhere)");
+    R_RT_HW: Bool = Bool::new("r.rt.hw", false, "hardware ray tracing (Graphics page): every ray type below on the RT cores");
+    R_RT_SHADOW: Bool = Bool::new("r.rt.shadow", false, "RT cores: sun shadow rays");
+    R_RT_GI: Bool = Bool::new("r.rt.gi", false, "RT cores: bounce light (GI) rays");
+    R_RT_REFL: Bool = Bool::new("r.rt.refl", false, "RT cores: water reflection rays");
+    R_RT_PROBE: Bool = Bool::new("r.rt.probe", false, "RT cores: Standard lighting's probe rays");
+    R_RT_LAMP: Bool = Bool::new("r.rt.lamp", false, "RT cores: lamp (local light) shadow rays");
+    R_RT_FOG: Bool = Bool::new("r.rt.fog", false, "RT cores: fog / god-ray shadow rays");
+    R_RT_PRIMARY: Bool = Bool::new("r.rt.primary", false, "RT cores: camera (primary) rays");
+    R_RT_TIGHTBOXES: Bool = Bool::new("r.rt.tightboxes", true, "RT cores: a detailed brick's AABB = its occupied voxels (fewer false candidates; same image)");
     UI_OVERLAY: Bool = Bool::new("ui.overlay", false, "performance overlay: every render pass, the camera position");
     UI_FPS: Bool = Bool::new("ui.fps", false, "frame rate and frame time in the top-right corner (F3)");
     UI_CROSSHAIR: Bool = Bool::new("ui.crosshair", true, "the mark in the middle of the screen");

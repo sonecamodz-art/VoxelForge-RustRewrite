@@ -143,7 +143,36 @@ pub fn shader_defines() -> String {
     if R_GI_OBJECTS.get() {
         def("GI_OBJECTS 1");
     }
+    let rt_on = RT_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) && rt_any_type();
+    if rt_on {
+        def("RT_ANY 1");
+        for (c, name) in [(&R_RT_SHADOW, "RT_SHADOW"), (&R_RT_GI, "RT_GI"), (&R_RT_REFL, "RT_REFL"), (&R_RT_PROBE, "RT_PROBE"),
+                          (&R_RT_LAMP, "RT_LAMP"), (&R_RT_FOG, "RT_FOG"), (&R_RT_PRIMARY, "RT_PRIMARY")] {
+            if rt_type(c) {
+                def(&format!("{name} 1"));
+            }
+        }
+    }
+    if rt_on {
+        d.insert_str(0, "#extension GL_EXT_ray_query : require\n");
+    }
     d
+}
+
+/// The acceleration structures exist (update_rt): the RT_* defines may be on.
+static RT_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A ray type on the RT cores (r.rt.hw: all of them).
+fn rt_type(c: &crate::cvar::Bool) -> bool {
+    cvars::R_RT_HW.get() || c.get()
+}
+fn rt_any_type() -> bool {
+    use cvars::*;
+    [&R_RT_SHADOW, &R_RT_GI, &R_RT_REFL, &R_RT_PROBE, &R_RT_LAMP, &R_RT_FOG, &R_RT_PRIMARY].into_iter().any(rt_type)
+}
+/// Hardware ray queries wanted: the device has them, r.rt, and a ray type asks.
+pub fn rt_wanted(ctx: &Context) -> bool {
+    ctx.ray_query && cvars::R_RT.get() && rt_any_type()
 }
 
 fn fog_slices() -> u32 {
@@ -804,7 +833,12 @@ impl Renderer {
         let l0: Vec<(u32, DT)> = [0u32, 1, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27].iter().map(|&b| (b, cis)).collect();
         self.l0 = shader::make_set_layout(dev, &l0);
         let sb = DT::STORAGE_BUFFER;
-        self.l1 = shader::make_set_layout(dev, &[(1, sb), (2, sb), (3, sb), (4, sb), (5, sb), (6, sb), (8, sb), (9, sb)]);
+        let mut l1 = vec![(1, sb), (2, sb), (3, sb), (4, sb), (5, sb), (6, sb), (8, sb), (9, sb)];
+        if ctx.ray_query {
+            // ray queries: 0 the TLAS, 7 the primitive -> brick table (gfx::rt)
+            l1.extend([(0, DT::ACCELERATION_STRUCTURE_KHR), (7, sb)]);
+        }
+        self.l1 = shader::make_set_layout(dev, &l1);
         self.l2 = shader::make_set_layout(dev, &[(0, DT::UNIFORM_BUFFER), (1, DT::UNIFORM_BUFFER)]);
         self.l3 = (0..L3_COUNT)
             .map(|i| {
@@ -883,6 +917,7 @@ impl Renderer {
             vk::DescriptorPoolSize { ty: DT::STORAGE_IMAGE, descriptor_count: 280 },
             vk::DescriptorPoolSize { ty: DT::STORAGE_BUFFER, descriptor_count: 40 },
             vk::DescriptorPoolSize { ty: DT::UNIFORM_BUFFER, descriptor_count: 160 },
+            vk::DescriptorPoolSize { ty: DT::ACCELERATION_STRUCTURE_KHR, descriptor_count: 4 },
         ];
         self.pool = vkc(unsafe { dev.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(128).pool_sizes(&sizes), None) }, "descriptor pool");
         let alloc = |l: vk::DescriptorSetLayout| -> vk::DescriptorSet {
@@ -964,6 +999,11 @@ impl Renderer {
             if !self.gi_cache_buf.is_null() {
                 w.sbuf(sl.s1, 8, self.gi_cache_buf.buf);
                 w.sbuf(sl.s1, 9, self.gi_queue_buf.buf);
+            }
+            if g.rt.active() {
+                // ray queries: the TLAS + the primitive table
+                w.sbuf(sl.s1, 7, g.rt.prim_buffer());
+                w.accel(sl.s1, 0, g.rt.tlas());
             }
             w.ubuf(sl.s2, 0, sl.scene_u.buf);
             w.ubuf(sl.s2, 1, sl.lights_u.buf);
@@ -1237,6 +1277,21 @@ impl Renderer {
 
     /// Per frame, after set_frame_uniforms: reallocations the settings asked for, pipeline
     /// rebuilds when the shader defines changed, the bodies into this slot, set re-baking.
+    /// Per frame, before update_sets: ray queries switched on / off (or their boxes' setting
+    /// changed) build / drop the acceleration structures; the shader defines follow.
+    pub fn update_rt(&mut self, ctx: &Context, world: &World) {
+        let want = rt_wanted(ctx);
+        self.gpu.rt_wanted = want;
+        if want != self.gpu.rt.active() || (want && self.gpu.rt.stale_boxes()) {
+            ctx.wait_idle();
+            self.gpu.retire_syncs(ctx, true);
+            self.gpu.rt.destroy(ctx);
+            self.gpu.rt_rebuild(ctx, world);
+            self.sets_dirty = true;
+        }
+        RT_ACTIVE.store(self.gpu.rt.active(), std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn update_sets(&mut self, ctx: &Context, pp: usize) {
         if self.std.sh_n != self.std.sh_n_alloc {
             // r.std.shadows changed the shadow map resolution
@@ -1378,6 +1433,7 @@ impl SceneUbo {
 #[derive(Default)]
 pub struct SetWriter {
     ws: Vec<(vk::DescriptorSet, u32, vk::DescriptorType, vk::DescriptorImageInfo, vk::DescriptorBufferInfo)>,
+    accels: Vec<(vk::DescriptorSet, u32, vk::AccelerationStructureKHR)>,
 }
 
 impl SetWriter {
@@ -1392,6 +1448,9 @@ impl SetWriter {
         let ii = vk::DescriptorImageInfo { sampler: s, image_view: view, image_layout: l };
         self.ws.push((set, b, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, ii, Default::default()));
     }
+    pub fn accel(&mut self, set: vk::DescriptorSet, b: u32, a: vk::AccelerationStructureKHR) {
+        self.accels.push((set, b, a));
+    }
     pub fn ubuf(&mut self, set: vk::DescriptorSet, b: u32, buf: vk::Buffer) {
         let bi = vk::DescriptorBufferInfo { buffer: buf, offset: 0, range: vk::WHOLE_SIZE };
         self.ws.push((set, b, vk::DescriptorType::UNIFORM_BUFFER, Default::default(), bi));
@@ -1401,7 +1460,7 @@ impl SetWriter {
         self.ws.push((set, b, vk::DescriptorType::STORAGE_BUFFER, Default::default(), bi));
     }
     pub fn flush(self, dev: &ash::Device) {
-        let writes: Vec<vk::WriteDescriptorSet> = self
+        let mut writes: Vec<vk::WriteDescriptorSet> = self
             .ws
             .iter()
             .map(|(set, b, ty, ii, bi)| {
@@ -1412,6 +1471,16 @@ impl SetWriter {
                 }
             })
             .collect();
+        let mut aw: Vec<vk::WriteDescriptorSetAccelerationStructureKHR> = self
+            .accels
+            .iter()
+            .map(|(_, _, a)| vk::WriteDescriptorSetAccelerationStructureKHR::default().acceleration_structures(std::slice::from_ref(a)))
+            .collect();
+        for ((set, b, _), a) in self.accels.iter().zip(aw.iter_mut()) {
+            let mut w = vk::WriteDescriptorSet::default().dst_set(*set).dst_binding(*b).descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR);
+            w.descriptor_count = 1;
+            writes.push(w.push_next(a));
+        }
         unsafe { dev.update_descriptor_sets(&writes, &[]) };
     }
 }

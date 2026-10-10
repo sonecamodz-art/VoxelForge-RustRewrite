@@ -111,6 +111,7 @@ pub fn run_shot(a: &ShotArgs) -> i32 {
     }
     log::info!(target: "shot", "scene ready in {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
     let mut r = Renderer::new(&ctx, &mut world, &mut objects, a.w, a.h, a.w, a.h);
+    r.update_rt(&ctx, &world); // (before the edit self-tests: they sync the acceleration structures too)
     if let Some(e) = endless.as_mut() {
         // The far horizon before the first frame (VF_HORIZON_WAIT seconds at most, default 120).
         let secs = std::env::var("VF_HORIZON_WAIT").ok().and_then(|v| v.parse().ok()).unwrap_or(120.0);
@@ -219,6 +220,7 @@ pub fn run_shot(a: &ShotArgs) -> i32 {
         let time = frame as f32 / 60.0;
         r.update_lights(&world, &objects, cam_now.pos, time);
         r.set_frame_uniforms(&cam_now, &prev, frame, cvars::R_EXPOSURE.get(), time, [0.0, 0.0]);
+        r.update_rt(&ctx, &world);
         r.update_sets(&ctx, pp);
         let cb = ctx.begin_one_shot();
         {
