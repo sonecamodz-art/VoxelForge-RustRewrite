@@ -475,8 +475,13 @@ impl Running {
         }
         let rad = g.brush_radius;
         let c = Vec3::new(h.cell[0] as f32 + 0.5, h.cell[1] as f32 + 0.5, h.cell[2] as f32 + 0.5);
+        let mut spawned = 0;
         match button {
-            MouseButton::Left => g.world.fill_sphere(c.x, c.y, c.z, rad, wm::AIR),
+            MouseButton::Left => {
+                g.world.fill_sphere(c.x, c.y, c.z, rad, wm::AIR);
+                // Pieces cut loose fall as bodies (a cut tree topples).
+                spawned = crate::destruction::world_carve_detach(&mut g.world, c, rad, &mut g.objects, None);
+            }
             MouseButton::Right => {
                 let n = Vec3::new(h.normal[0] as f32, h.normal[1] as f32, h.normal[2] as f32);
                 let p = c + n * rad;
@@ -487,6 +492,11 @@ impl Running {
         physics::wake_near(&mut g.objects, c, rad + 12.0); // nearby bodies fall
         let t = Instant::now();
         g.r.gpu.sync(&self.ctx, &mut g.world);
+        if spawned > 0 {
+            g.r.gpu.init_objects(&self.ctx, &g.world, &mut g.objects);
+            g.r.rebind_object_buffers();
+            g.phys_prev.clear();
+        }
         log::info!(target: "edit", "edit at {:?} r {rad}: sync {:.2} ms", h.cell, t.elapsed().as_secs_f64() * 1e3);
     }
 

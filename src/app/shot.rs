@@ -41,13 +41,13 @@ pub fn default_camera(world: &World) -> FlyCamera {
     let mut cam = FlyCamera { pos: Vec3::new(c - 260.0, terrain_at(world, c - 260.0, c - 260.0) + 150.0, c - 260.0), ..Default::default() };
     cam.yaw = 0.8;
     cam.pitch = -0.3;
-    apply_cam_env(&mut cam);
+    apply_cam_env(&mut cam, "VF_CAM");
     cam
 }
 
 /// VF_CAM="x,y,z,yaw,pitch" overrides the camera (reproduce a windowed view in a shot).
-pub fn apply_cam_env(cam: &mut FlyCamera) {
-    if let Ok(s) = std::env::var("VF_CAM") {
+pub fn apply_cam_env(cam: &mut FlyCamera, var: &str) {
+    if let Ok(s) = std::env::var(var) {
         let v: Vec<f32> = s.split(',').filter_map(|t| t.trim().parse().ok()).collect();
         if v.len() == 5 {
             cam.pos = Vec3::new(v[0], v[1], v[2]);
@@ -108,12 +108,21 @@ pub fn run_shot(a: &ShotArgs) -> i32 {
     // a sphere where the camera looks; VF_PLACETEST=material drops a ball ahead of it.
     if let Ok(v) = std::env::var("VF_CARVETEST") {
         let rad: f32 = v.parse().ok().filter(|r: &f32| *r >= 1.0).unwrap_or(22.0);
-        let h = world.raycast(cam.pos, cam.forward(), 600.0, 0);
+        // VF_CARVE_CAM (same format as VF_CAM) aims the carve from elsewhere than the view.
+        let mut aim = cam;
+        apply_cam_env(&mut aim, "VF_CARVE_CAM");
+        let h = world.raycast(aim.pos, aim.forward(), 600.0, 0);
         if h.hit {
-            world.fill_sphere(h.cell[0] as f32 + 0.5, h.cell[1] as f32 + 0.5, h.cell[2] as f32 + 0.5, rad, 0);
+            let c = crate::math::Vec3::new(h.cell[0] as f32 + 0.5, h.cell[1] as f32 + 0.5, h.cell[2] as f32 + 0.5);
+            world.fill_sphere(c.x, c.y, c.z, rad, 0);
+            let spawned = crate::destruction::world_carve_detach(&mut world, c, rad, &mut objects, None);
             let n = world.dirty_grid.len();
             r.gpu.sync(&ctx, &mut world);
-            log::info!(target: "carvetest", "carved r={rad} at {:?} ({n} dirty cells)", h.cell);
+            if spawned > 0 {
+                r.gpu.init_objects(&ctx, &world, &mut objects);
+                r.rebind_object_buffers();
+            }
+            log::info!(target: "carvetest", "carved r={rad} at {:?} ({n} dirty cells, {spawned} bodies)", h.cell);
         }
     }
     if let Ok(v) = std::env::var("VF_PLACETEST") {
@@ -135,6 +144,11 @@ pub fn run_shot(a: &ShotArgs) -> i32 {
         }
         r.gpu.update_objects(&objects);
         let asleep = objects.iter().filter(|o| o.asleep).count();
+        for (i, o) in objects.iter().enumerate() {
+            let com = o.pose.apply(o.com);
+            log::debug!(target: "simtest", "body {i}: com {:.0},{:.0},{:.0} up.y {:.2} {}{}", com.x, com.y, com.z, (o.pose.r * crate::math::Vec3::Y).y,
+                        if o.asleep { "asleep" } else { "awake" }, if o.hinged { " hinged" } else { "" });
+        }
         log::info!(target: "simtest", "{} bodies, {steps} steps in {:.1} ms, body0 y {y0:.1} -> {:.1}, {asleep} asleep",
                    objects.len(), t.elapsed().as_secs_f64() * 1e3, objects.first().map_or(0.0, |o| o.pose.t.y));
     }

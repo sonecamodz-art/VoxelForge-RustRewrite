@@ -78,19 +78,20 @@ mirror (upload, incremental edit sync, chunk streaming sync, bodies + BVH), the 
 views, locked view), post (exposure, bloom, tonemap), the window + headless shots, basic carve
 / place editing, the player controller (walking, steps, crouch, swimming, flying), rigid-body
 physics (voxel-shell contacts, warm-started sequential impulses with friction, sleeping,
-felled-tree hinges; fixed 60 Hz with interpolated rendering).
+felled-tree hinges; fixed 60 Hz with interpolated rendering), destruction (carved-loose pieces
+become bodies, a cut tree takes its own crown and topples toward the cut; bodies split).
 
-Not yet ported: generators 2 / 3, endless streaming (`StreamManager`, far horizon), destruction
-(cutting loose pieces into bodies), fluid simulation, saves / region files, the undo stack and
-edit tools (shapes, lines, brush tools), the ImGui UI (menus, editor, map, inventory), audio,
-weather presets, mesh import, NVIDIA DLSS / NRD and hardware ray queries.
+Not yet ported: generators 2 / 3, endless streaming (`StreamManager`, far horizon), fluid
+simulation, saves / region files, the undo stack and edit tools (shapes, lines, brush tools),
+the ImGui UI (menus, editor, map, inventory), audio, weather presets, mesh import, NVIDIA DLSS
+/ NRD and hardware ray queries.
 
 ## Debugging
 
 `--validation` enables the Khronos validation layer. `VF_SKIP=gi,fog` skips passes by label,
 `VF_MAXPASS=N` records only the first N dispatches, `VF_ROBUST=1` enables robust buffer / image
-access, `VF_SIMTEST=steps` settles the bodies before a `--shot`, `VF_LOG=debug|trace` raises
-the log level.
+access, `VF_SIMTEST=steps` settles the bodies before a `--shot` (after `VF_CARVETEST=radius`,
+aimed by `VF_CARVE_CAM`), `VF_LOG=debug|trace` raises the log level.
 
 Known issue: Mesa's software driver (llvmpipe / lavapipe) crashes in the GI and froxel passes
 with emissive-light sampling on (a driver codegen bug reading a uniform block in divergent

@@ -10,6 +10,7 @@ mod app;
 mod camera;
 mod cvar;
 mod cvars;
+mod destruction;
 mod gfx;
 mod lights;
 mod log;
