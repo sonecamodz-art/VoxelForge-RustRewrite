@@ -110,7 +110,9 @@ pub fn run_shot(a: &ShotArgs) -> i32 {
         e.stream.load_now(&mut world, cam.pos.x, cam.pos.z, r, &mut Vec::new(), &mut Vec::new());
     }
     log::info!(target: "shot", "scene ready in {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
-    let mut r = Renderer::new(&ctx, &mut world, &mut objects, a.w, a.h, a.w, a.h);
+    let mut path = super::render_path::RenderPath::new(&ctx);
+    let cfg = path.begin(&ctx, a.w, a.h);
+    let mut r = Renderer::new(&ctx, &mut world, &mut objects, cfg.rw, cfg.rh, cfg.ow, cfg.oh);
     r.update_rt(&ctx, &world); // (before the edit self-tests: they sync the acceleration structures too)
     if let Some(e) = endless.as_mut() {
         // The far horizon before the first frame (VF_HORIZON_WAIT seconds at most, default 120).
@@ -211,35 +213,21 @@ pub fn run_shot(a: &ShotArgs) -> i32 {
     let pan = if motion { 0.02 } else { 0.0 };
     let mut cam_now = cam;
     let mut prev = cam;
-    let standard = r.standard_mode();
-    let raw = cvars::R_DENOISER.is("none");
     let t_frames = std::time::Instant::now();
     let mut gpu_total = 0.0;
     for frame in 0..a.frames.max(1) {
         let pp = (frame & 1) as usize;
         let time = frame as f32 / 60.0;
         r.update_lights(&world, &objects, cam_now.pos, time);
-        r.set_frame_uniforms(&cam_now, &prev, frame, cvars::R_EXPOSURE.get(), time, [0.0, 0.0]);
+        path.retarget(&ctx, &mut r, &mut post, a.w, a.h);
+        r.set_frame_uniforms(&cam_now, &prev, frame, cvars::R_EXPOSURE.get(), time, path.jitter(frame));
         r.update_rt(&ctx, &world);
         r.update_sets(&ctx, pp);
         let cb = ctx.begin_one_shot();
         {
             let rec = Rec { ctx: &ctx, cb };
-            if standard || raw {
-                if standard {
-                    r.record_standard(&rec);
-                } else {
-                    r.record_raw(&rec);
-                }
-                crate::gfx::context::pass_barrier(&ctx.device, cb);
-                r.record_torch_fx(&rec, 1, r.w, r.h);
-                post.prepare(&ctx.device, cb, 1, 1.0 / 60.0);
-                post.tonemap(&ctx.device, cb, 1, r.w, r.h, cvars::R_EXPOSURE.get(), 0, 1 << 30, -1);
-                r.stamp(&rec, "tonemap");
-            } else {
-                r.record(&rec);
-            }
-            r.record_dust(&rec, r.w, r.h);
+            let (sw, sh) = path.record(&rec, &mut r, &mut post, 1.0 / 60.0, cvars::R_EXPOSURE.get(), frame);
+            r.record_dust(&rec, sw, sh);
         }
         ctx.end_one_shot_and_wait(cb);
         r.read_timings(&ctx, pp);
@@ -249,6 +237,7 @@ pub fn run_shot(a: &ShotArgs) -> i32 {
     }
     let per = t_frames.elapsed().as_secs_f64() * 1e3 / a.frames.max(1) as f64;
     let passes: Vec<String> = r.pass_ms.iter().map(|(n, ms)| format!("{n}={ms:.2}")).collect();
+    log::info!(target: "shot", "{}: render {}x{} -> {}x{}", path.describe(&r), r.w, r.h, r.ow, r.oh);
     log::info!(target: "shot", "{} frames, {per:.1} ms/frame wall; last frame GPU {gpu_total:.2} ms: {}", a.frames, passes.join(" "));
     let pp = ((a.frames.max(1) - 1) & 1) as usize;
     let (img, bpp) = match a.dump.as_str() {
@@ -290,6 +279,7 @@ pub fn run_shot(a: &ShotArgs) -> i32 {
     }
     post.destroy(&ctx);
     r.destroy(&ctx);
+    path.destroy(&ctx);
     ctx.destroy();
     if ok.is_ok() && saved.is_ok() { 0 } else { 1 }
 }

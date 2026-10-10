@@ -14,6 +14,7 @@
 //! `record` / `record_standard` / `record_raw` -> the caller resolves to `out_tex`.
 
 pub mod frame;
+pub mod nrd_path;
 pub mod passes;
 pub mod record;
 

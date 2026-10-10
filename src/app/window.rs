@@ -22,6 +22,7 @@ use crate::camera::{FlyCamera, MoveInput};
 use crate::cvars;
 use crate::gfx::context::{image_barrier, memory_barrier, vkc, Access, Context, Stage, COLOR_LAYERS, COLOR_RANGE};
 use crate::gfx::postfx::PostFx;
+use super::render_path::RenderPath;
 use crate::gfx::renderer::record::Rec;
 use crate::gfx::renderer::Renderer;
 use crate::math::Vec3;
@@ -122,6 +123,8 @@ struct Running {
     /// A menu choice, carried out at the start of the next frame (never while a frame's
     /// commands still reference the world it would replace).
     pending: Option<MenuAction>,
+    /// Lighting / denoiser / DLSS resolve and the render resolution.
+    path: RenderPath,
 }
 
 struct App {
@@ -183,6 +186,7 @@ impl ApplicationHandler for App {
         let fences = [ctx.create_fence(true), ctx.create_fence(true)];
         let cmds = [ctx.alloc_cmd(), ctx.alloc_cmd()];
         let gui = Gui::new(&ctx, &window, sc.format);
+        let path = RenderPath::new(&ctx);
         // The world generates (or loads) on a worker while the window shows progress.
         let progress = Arc::new(AtomicI32::new(0));
         let p2 = progress.clone();
@@ -203,6 +207,7 @@ impl ApplicationHandler for App {
             menu: Menu::default(),
             pending: None,
             phase: Phase::Loading { thread: Some(thread), progress },
+            path,
         });
     }
 
@@ -608,12 +613,14 @@ impl Running {
             KeyCode::F6 => {
                 let cur = cvars::R_SCALE.get();
                 let i = RENDER_SCALES.iter().position(|&s| (s - cur).abs() < 0.01).map_or(0, |i| (i + 1) % RENDER_SCALES.len());
-                cvars::R_SCALE.set(RENDER_SCALES[i]);
-                self.need_resize = true;
+                cvars::R_SCALE.set(RENDER_SCALES[i]); // (RenderPath::retarget resizes)
             }
             KeyCode::F5 | KeyCode::F9 => {
                 let Phase::Game(g) = &mut self.phase else { return };
                 g.quick_save_load(&self.ctx, code == KeyCode::F5);
+                if code == KeyCode::F9 {
+                    self.path.reset_history();
+                }
             }
             KeyCode::F10 => {
                 let Phase::Game(g) = &mut self.phase else { return };
@@ -630,9 +637,30 @@ impl Running {
                 log::info!(target: "app", "lighting: {}", cvars::R_LIGHTING.get());
             }
             KeyCode::KeyN => {
-                let none = cvars::R_DENOISER.is("none");
-                cvars::R_DENOISER.set(if none { "svgf" } else { "none" });
+                // rr -> svgf -> nrd -> none (what isn't available is skipped)
+                let order = ["rr", "svgf", "nrd", "none"];
+                let r = match &self.phase {
+                    Phase::Game(g) => Some(&*g.r),
+                    _ => None,
+                };
+                let cur = order.iter().position(|&d| cvars::R_DENOISER.is(d)).unwrap_or(1);
+                for k in 1..=order.len() {
+                    let next = order[(cur + k) % order.len()];
+                    cvars::R_DENOISER.set(next);
+                    if self.path.denoiser(r).name() == RenderPath::denoiser_for(next).name() {
+                        break;
+                    }
+                }
                 log::info!(target: "app", "denoiser: {}", cvars::R_DENOISER.get());
+            }
+            KeyCode::F8 => {
+                // DLSS mode: DLAA -> Quality -> Balanced -> Performance -> Ultra Performance
+                cvars::R_DLSS_QUALITY.set((cvars::R_DLSS_QUALITY.get() + 1) % 5);
+                log::info!(target: "app", "DLSS {}", crate::gfx::dlss::Quality::from_index(cvars::R_DLSS_QUALITY.get()).name());
+            }
+            KeyCode::KeyJ => {
+                cvars::R_AA.set(if cvars::R_AA.is("off") { "dlaa" } else { "off" });
+                log::info!(target: "app", "anti-aliasing: {}", cvars::R_AA.get());
             }
             KeyCode::BracketLeft => cvars::R_EXPOSURE.set(cvars::R_EXPOSURE.get() / 1.15),
             KeyCode::BracketRight => cvars::R_EXPOSURE.set(cvars::R_EXPOSURE.get() * 1.15),
@@ -697,13 +725,6 @@ impl Running {
         }
     }
 
-    /// Render sizes for the swapchain extent and r.scale.
-    fn render_size(&self) -> (u32, u32) {
-        let s = cvars::R_SCALE.get();
-        let e = self.sc.extent;
-        (((e.width as f32 * s) as u32).max(64), ((e.height as f32 * s) as u32).max(64))
-    }
-
     /// One frame. Returns false to quit.
     fn frame(&mut self) -> bool {
         let dev = self.ctx.device.clone();
@@ -728,6 +749,7 @@ impl Running {
                     if let Phase::Game(g) = &mut self.phase {
                         g.save_load(&self.ctx, SaveLoad::Load(path));
                     }
+                    self.path.reset_history();
                     self.menu.screen = Screen::Closed;
                     self.set_captured(true);
                 }
@@ -739,19 +761,21 @@ impl Running {
                 return true; // minimised
             }
             self.sc.recreate(&self.ctx, self.surface, (sz.width, sz.height));
-            let (rw, rh) = self.render_size();
-            if let Phase::Game(g) = &mut self.phase {
-                g.r.resize(&self.ctx, rw, rh, rw, rh);
-                g.post.resize(&self.ctx, &g.r);
-            }
-            self.need_resize = false;
+            self.need_resize = false; // (the renderer follows in RenderPath::retarget)
         }
         // Loading: finish the world when the worker is done (then build the renderer).
         if let Phase::Loading { thread, progress } = &mut self.phase {
             if thread.as_ref().is_some_and(|t| t.is_finished()) {
                 let super::Startup { mut world, mut objects, state, endless } = thread.take().unwrap().join().expect("world generation panicked");
-                let (rw, rh) = self.render_size();
-                let r = Renderer::new(&self.ctx, &mut world, &mut objects, rw, rh, rw, rh);
+                let c = self.path.begin(&self.ctx, self.sc.extent.width, self.sc.extent.height);
+                let r = Renderer::new(&self.ctx, &mut world, &mut objects, c.rw, c.rh, c.ow, c.oh);
+                // what the options offer
+                super::ui::settings::set_caps(super::ui::settings::Caps {
+                    rr: self.path.dlss.rr_available,
+                    sr: self.path.dlss.sr_available,
+                    rt: self.ctx.ray_query,
+                    nrd: r.nrd_available(),
+                });
                 let post = PostFx::new(&self.ctx, &r);
                 let mut cam = default_camera(&world);
                 let mut fluid = FluidSim::default();
@@ -804,6 +828,8 @@ impl Running {
             }
         }
         let Phase::Game(g) = &mut self.phase else { return true };
+        // a mode / quality / scale / display change: the render size, the DLSS features
+        self.path.retarget(&self.ctx, &mut g.r, &mut g.post, self.sc.extent.width, self.sc.extent.height);
         g.r.read_timings(&self.ctx, slot);
         let sw = self.ctx.swapchain_fn.as_ref().unwrap();
         let (img, suboptimal) = match unsafe { sw.acquire_next_image(self.sc.handle, u64::MAX, self.acquire[slot], vk::Fence::null()) } {
@@ -857,7 +883,7 @@ impl Running {
         // --- render ------------------------------------------------------------------------------
         let r = &mut g.r;
         r.update_lights(&g.world, &g.objects, g.cam.pos, time);
-        r.set_frame_uniforms(&g.cam, &g.prev_cam, g.frame, exposure, time, [0.0, 0.0]);
+        r.set_frame_uniforms(&g.cam, &g.prev_cam, g.frame, exposure, time, self.path.jitter(g.frame));
         r.update_rt(&self.ctx, &g.world);
         r.update_sets(&self.ctx, slot);
         let cb = self.cmds[slot];
@@ -866,21 +892,8 @@ impl Running {
         // The previous frame may still execute: its writes visible first (shared histories).
         memory_barrier(&dev, cb, Stage::ALL_COMMANDS, Access::MEMORY_WRITE, Stage::ALL_COMMANDS, Access::MEMORY_READ | Access::MEMORY_WRITE);
         let rec = Rec { ctx: &self.ctx, cb };
-        let (w, h) = (r.w, r.h);
-        if r.standard_mode() || cvars::R_DENOISER.is("none") {
-            if r.standard_mode() {
-                r.record_standard(&rec);
-            } else {
-                r.record_raw(&rec);
-            }
-            crate::gfx::context::pass_barrier(&dev, cb);
-            r.record_torch_fx(&rec, 1, w, h);
-            g.post.prepare(&dev, cb, 1, dt);
-            g.post.tonemap(&dev, cb, 1, w, h, exposure, 0, 1 << 30, -1);
-            r.stamp(&rec, "tonemap");
-        } else {
-            r.record(&rec);
-        }
+        // (w, h): the region of out_tex holding the image - the display size after a DLSS resolve
+        let (w, h) = self.path.record(&rec, r, &mut g.post, dt, exposure, g.frame);
         r.record_dust(&rec, w, h);
         if let Some(t) = g.target.filter(|_| cvars::R_BRUSH_PREVIEW.get()) {
             let pc = brush_preview_pc(&t, &g.world.palette, g.place_mat, (w, h), PREVIEW_CARVE | PREVIEW_PLACE);
@@ -1039,14 +1052,14 @@ impl Running {
         g.title_at = Instant::now();
         let gpu: f32 = g.r.pass_ms.iter().map(|p| p.1).sum();
         let mut t = format!(
-            "VoxelForge  {:.0} fps ({:.1} ms, GPU {:.1} ms)  {}x{}  {}{}",
+            "VoxelForge  {:.0} fps ({:.1} ms, GPU {:.1} ms)  {}x{}{}  {}",
             1000.0 / g.frame_ms.max(0.01),
             g.frame_ms,
             gpu,
             g.r.w,
             g.r.h,
-            cvars::R_LIGHTING.get(),
-            if cvars::R_LIGHTING.is("raytraced") { format!("/{}", cvars::R_DENOISER.get()) } else { String::new() },
+            if (g.r.ow, g.r.oh) != (g.r.w, g.r.h) { format!(" -> {}x{}", g.r.ow, g.r.oh) } else { String::new() },
+            self.path.describe(&g.r),
         );
         if cvars::UI_OVERLAY.get() {
             let p = g.cam.pos;
@@ -1072,6 +1085,7 @@ impl Running {
             g.post.destroy(&self.ctx);
             g.r.destroy(&self.ctx);
         }
+        self.path.destroy(&self.ctx);
         let dev = &self.ctx.device;
         unsafe {
             for s in self.acquire {

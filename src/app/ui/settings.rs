@@ -15,7 +15,7 @@ pub const ARCHIVED: &[&str] = &[
     // Display
     "app.fullscreen", "r.present", "app.fpscap", "r.exposure", "r.autoexposure",
     // Graphics
-    "r.lighting", "r.denoiser", "r.gi.bounces", "r.gi.cache", "r.scale", "r.view.distance", "r.horizon", "r.std.shadows", "r.std.softshadows",
+    "r.lighting", "r.denoiser", "r.rt.hw", "r.gi.bounces", "r.gi.cache", "r.dlss.quality", "r.aa", "r.scale", "r.view.distance", "r.horizon", "r.std.shadows", "r.std.softshadows",
     "r.std.gispeed", "r.lights", "r.lights.shadows", "r.lights.quality", "r.grass", "r.grass.distance", "r.grass.far", "r.grass.shadows",
     "r.grass.style", "r.water", "r.water.reflect", "r.water.caustics", "r.underwater", "r.fog.quality", "r.bloom", "r.dust", "r.foliage.sss",
     "r.foliage.light", "r.gi.filter",
@@ -115,15 +115,46 @@ fn set(cv: &dyn CVar, v: &str) {
 
 /// A choice among values (`labels` shown); `avail[i]` false = that value greyed out.
 fn choice(ui: &mut Ui, label: &str, name: &str, values: &[&str], labels: &[&str], help: &str, enabled: bool) {
+    choice_some(ui, label, name, values, labels, &[], help, enabled);
+}
+
+/// A choice whose options can be unavailable one by one (`avail`: per option, empty = all).
+#[allow(clippy::too_many_arguments)]
+fn choice_some(ui: &mut Ui, label: &str, name: &str, values: &[&str], labels: &[&str], avail: &[bool], help: &str, enabled: bool) {
     let Some(cv) = cvar::find(name) else { return };
     let cur = cv.str();
     row(ui, label, help, enabled, |ui| {
-        for (v, l) in values.iter().zip(labels) {
-            if ui.selectable_label(cur == *v, *l).clicked() && cur != *v {
+        for (i, (v, l)) in values.iter().zip(labels).enumerate() {
+            let on = avail.get(i).copied().unwrap_or(true);
+            let r = ui.add_enabled(on, egui::Button::selectable(cur == *v, *l));
+            let r = if on { r } else { r.on_disabled_hover_text("Not available on this computer / build.") };
+            if r.clicked() && cur != *v {
                 set(cv, v);
             }
         }
     });
+}
+
+/// What this computer and build can do (set once by the window): which options are offered.
+#[derive(Clone, Copy, Default)]
+pub struct Caps {
+    /// DLSS Ray Reconstruction.
+    pub rr: bool,
+    /// DLSS Super Resolution / DLAA.
+    pub sr: bool,
+    /// Hardware ray queries.
+    pub rt: bool,
+    /// NVIDIA NRD.
+    pub nrd: bool,
+}
+static CAPS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+pub fn set_caps(c: Caps) {
+    let b = c.rr as u8 | (c.sr as u8) << 1 | (c.rt as u8) << 2 | (c.nrd as u8) << 3;
+    CAPS.store(b, std::sync::atomic::Ordering::Relaxed);
+}
+pub fn caps() -> Caps {
+    let b = CAPS.load(std::sync::atomic::Ordering::Relaxed);
+    Caps { rr: b & 1 != 0, sr: b & 2 != 0, rt: b & 4 != 0, nrd: b & 8 != 0 }
 }
 
 fn toggle(ui: &mut Ui, label: &str, name: &str, help: &str, enabled: bool) {
@@ -213,13 +244,21 @@ fn page_display(ui: &mut Ui) {
 
 fn page_graphics(ui: &mut Ui) {
     let std_ = is("r.lighting", "standard");
+    let caps = caps();
+    let rr_path = !std_ && is("r.denoiser", "rr") && caps.rr;
+    let nrd_path = !std_ && is("r.denoiser", "nrd") && caps.nrd;
     section(ui, "Lighting");
     choice(ui, "Lighting", "r.lighting", &["standard", "raytraced"], &["Standard", "Ray traced"],
            "Ray traced: every pixel traces its own bounce light, then a denoiser cleans it up. Standard: bounce light from cached light probes, noise-free and fast.", true);
     if !std_ {
-        choice(ui, "Denoiser", "r.denoiser", &["svgf", "none"], &["Built-in", "None (raw)"], "Cleans up the ray traced image.", true);
-        choice(ui, "Bounce light smoothing", "r.gi.filter", &["normal", "smooth"], &["Normal", "Smooth"],
-               "Smooth halves the shimmer of bounce light but softens its detail.", true);
+        choice_some(ui, "Denoiser", "r.denoiser", &["rr", "svgf", "nrd"], &["DLSS Ray Reconstruction", "Built-in", "NVIDIA NRD"],
+                    &[caps.rr, true, caps.nrd],
+                    "Cleans up the ray traced image. DLSS Ray Reconstruction gives the cleanest result; the built-in denoiser is about twice as \
+                     fast. NVIDIA NRD: NVIDIA's real-time denoisers (REBLUR for bounce light, SIGMA for sun shadows).", true);
+        if !rr_path && !nrd_path {
+            choice(ui, "Bounce light smoothing", "r.gi.filter", &["normal", "smooth"], &["Normal", "Smooth"],
+                   "Built-in denoiser: Smooth halves the shimmer of bounce light but softens its detail.", true);
+        }
     } else {
         choice(ui, "Shadow quality", "r.std.shadows", &["low", "medium", "high", "ultra"], &["Low", "Medium", "High", "Ultra"],
                "How wide sun shadows' soft edges can get. Low = crisper and cheaper.", true);
@@ -227,6 +266,9 @@ fn page_graphics(ui: &mut Ui) {
         choice(ui, "Bounce light updates", "r.std.gispeed", &["slow", "normal", "fast"], &["Smooth", "Normal", "Fast"],
                "How quickly bounce light reacts when things move or change.", true);
     }
+    choice_some(ui, "Ray tracing", "r.rt.hw", &["0", "1"], &["Software", "Hardware (RT cores)"], &[true, caps.rt],
+                "How rays find what they hit. Software: the engine's own voxel tracer (a distance field skips empty space). Hardware: the GPU's \
+                 ray-tracing cores find the blocks a ray meets. Same image either way; which is faster depends on the GPU and the scene.", true);
     choice(ui, "Bounce light", "r.gi.bounces", &["1", "2"], &["Single", "Double"], "How many times light bounces in ray-traced lighting.", !std_);
     toggle(ui, "Bounce light cache", "r.gi.cache", "Double bounce: the second bounce is remembered per patch of surface instead of traced again.",
            !std_ && is("r.gi.bounces", "2"));
@@ -235,7 +277,15 @@ fn page_graphics(ui: &mut Ui) {
     choice(ui, "Lamp light quality", "r.lights.quality", &["full", "half"], &["Full", "Half"], "Half: a quarter of the cost, slightly softer.",
            is("r.lights", "1") && std_);
     section(ui, "Resolution");
-    slider(ui, "Render resolution", "r.scale", 0.5, 1.0, "", "The resolution the world is drawn at, as a share of the window (F6).", true, false, None);
+    choice_some(ui, "Upscaling", "r.aa", &["dlaa", "off"], &["NVIDIA DLSS", "Off"], &[caps.sr, true],
+                "DLSS smooths jagged edges (DLAA at full resolution) and upscales when the DLSS mode renders below 100% (J). Ray Reconstruction \
+                 upscales by itself.", !rr_path);
+    let dlss_on = rr_path || (caps.sr && is("r.aa", "dlaa"));
+    choice(ui, "DLSS mode", "r.dlss.quality", &["0", "1", "2", "3", "4"], &["DLAA", "Quality", "Balanced", "Performance", "Ultra perf."],
+           "The resolution the world renders at before DLSS upscales it (F8): DLAA = full resolution, Quality ~67%, Balanced ~58%, \
+            Performance 50%, Ultra performance 33%.", dlss_on);
+    slider(ui, "Render resolution", "r.scale", 0.5, 1.0, "", "Without DLSS: the resolution the world is drawn at, as a share of the window (F6).", !dlss_on,
+           false, None);
     section(ui, "World");
     slider(ui, "View distance", "r.view.distance", 4.0, 14.0, " chunks", "How much of the endless world stays loaded around you (a chunk is 12.8 m).", true, true, None);
     toggle(ui, "Far horizon", "r.horizon", "Past the view distance the land carries on to the horizon (hills, lakes, forests).", true);
@@ -287,6 +337,7 @@ fn page_controls(ui: &mut Ui) {
     key_row(ui, "F3", "FPS counter");
     key_row(ui, "[ / ]", "Brightness");
     key_row(ui, "L / N / F4 / F6 / F10", "Lighting / denoiser / debug view / render scale / reload shaders");
+    key_row(ui, "F8 / J", "DLSS mode / DLSS upscaling on-off");
 }
 
 fn page_world(ui: &mut Ui) {
