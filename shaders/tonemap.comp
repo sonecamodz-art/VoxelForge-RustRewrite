@@ -1,0 +1,55 @@
+// Tonemap a linear-HDR image (DLSS output / raw COLOR_IN) to LDR RGBA8 (PostFx).
+// Standalone (no common.glsl); shaders/tonemap.glsl is prepended.
+// + bloom (PostFx mip chain) and the auto-exposure factor, both optional.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D hdrIn;
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D ldrOut;
+layout(set = 0, binding = 2) uniform sampler2D bloomTex;
+layout(set = 0, binding = 3, rg32f) uniform readonly image2D expoState;
+// xMin/xMax: only this column range is written (split-screen compare draws each
+// half from a different source); divider >= 0 draws a thin vertical line there.
+layout(push_constant) uniform PC {
+    float exposure; int xMin; int xMax; int divider;
+    int op; float sat; float con; float bloom; int autoExpo; float wb[3];
+    vec4 uw;   // under water: eye depth (voxels, 0 = dry), clock (s), seconds since going under / coming up, strength
+} pc;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 res = imageSize(ldrOut);
+    if (p.x >= res.x || p.y >= res.y || p.x < pc.xMin || p.x >= pc.xMax) return;
+    vec3 hdr;
+    vec2 uv = (vec2(p) + 0.5) / vec2(res);
+    float uwK = pc.uw.w;
+    bool wet = pc.uw.x > 0.0;
+    // Just went under / came up: the eyes adjust - a strong blur and wobble that settle in
+    // ~0.8 s (0.6 s coming up: water running off), and a brief dip in brightness going under.
+    float tr = uwK > 0.0 ? 1.0 - smoothstep(0.0, wet ? 0.8 : 0.6, pc.uw.z) : 0.0;
+    if (uwK > 0.0 && (wet || tr > 0.0)) {
+        // Under water: the view wobbles (two slow sine warps), softens (a small blur, wider
+        // deeper down), dims with depth and closes in at the edges.
+        float t = pc.uw.y, deep = wet ? clamp(pc.uw.x / 200.0, 0.0, 1.0) : 0.0;
+        float wob = (wet ? 1.0 : 0.0) + 2.5 * tr;
+        vec2 w = vec2(sin(uv.y * 23.0 + t * 1.7) + 0.6 * sin(uv.y * 41.0 - t * 2.3),
+                      cos(uv.x * 19.0 + t * 1.4) + 0.6 * sin(uv.x * 37.0 + t * 2.1)) * (0.0016 * uwK * wob);
+        vec2 u = uv + w;
+        vec2 px = ((wet ? 1.0 + 1.5 * deep : 0.0) + 6.0 * tr) * uwK / vec2(res);
+        hdr = (textureLod(hdrIn, u, 0.0).rgb * 2.0 + textureLod(hdrIn, u + vec2(px.x, 0.0), 0.0).rgb +
+               textureLod(hdrIn, u - vec2(px.x, 0.0), 0.0).rgb + textureLod(hdrIn, u + vec2(0.0, px.y), 0.0).rgb +
+               textureLod(hdrIn, u - vec2(0.0, px.y), 0.0).rgb) / 6.0;
+        if (pc.bloom > 0.0) hdr += textureLod(bloomTex, u, 0.0).rgb * (pc.bloom * 6.0);
+        vec2 vc = uv - 0.5;
+        if (wet) hdr *= mix(1.0, 0.7, deep * min(uwK, 1.0)) * (1.0 - 0.45 * min(uwK, 1.0) * dot(vc, vc)) *
+                        (1.0 - 0.3 * tr * min(uwK, 1.0));
+    } else {
+        hdr = texelFetch(hdrIn, p, 0).rgb;
+        if (pc.bloom > 0.0) hdr += textureLod(bloomTex, uv, 0.0).rgb * (pc.bloom * 6.0);
+    }
+    float e = pc.exposure;
+    if (pc.autoExpo != 0) e *= imageLoad(expoState, ivec2(0)).r;
+    vec3 c = displayMap(hdr * e, pc.op, pc.sat, pc.con, vec3(pc.wb[0], pc.wb[1], pc.wb[2]));
+    if (pc.divider >= 0 && abs(p.x - pc.divider) <= 1) c = vec3(1.0);
+    imageStore(ldrOut, p, vec4(c, 1.0));
+}

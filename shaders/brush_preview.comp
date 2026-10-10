@@ -1,0 +1,139 @@
+// Edit-brush preview, drawn over the final image (after every denoiser / upscaler
+// branch, like lockview.comp) so it is identical in SVGF, RR and Standard and never
+// touches temporal history:
+//   - CARVE (LMB): the visible surface voxels the brush would remove, tinted red, with
+//     their cell edges — found through the G-buffer surface point, so exact.
+//   - PLACE (RMB): the EMPTY cells it would fill, as a translucent ghost in the
+//     material's colour with cell edges — a short DDA through the brush box, depth
+//     tested against the scene.
+// The voxel set is the same rule as src/brush.h (BrushBox::contains), in the target
+// volume's own voxel space (the world, or the hit body's local grid via worldToLocal).
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rgba8, SET(3) binding = 0) uniform image2D outImg;   // final LDR image (in place)
+layout(SET(3) binding = 3) uniform sampler2D gbNormal;
+layout(SET(3) binding = 4) uniform sampler2D gbPos;
+layout(SET(3) binding = 5) uniform usampler3D shapeVol;   // shape tool: the pending shape (volume mode)
+
+BEGIN_PASS_UNIFORMS
+PASS_UNIFORMS_BODY
+END_PASS_UNIFORMS
+
+layout(push_constant) uniform PC {
+    mat4 worldToLocal;
+    ivec4 carve;      // box corner .xyz, size .w
+    ivec4 place;      // box corner .xyz, shape .w (0 sphere, 1 cube)
+    vec4 placeCol;    // material colour .rgb, flags .w (1 on, 2 body target, 4 carve, 8 place,
+                      // 16 paint: the carve cells tinted with the colour instead of red,
+                      // 32 volume: the set is shapeVol at carve.xyz, size place.xyz)
+    ivec4 outRes;     // image region .xy
+} pc;
+
+bool volMode = false;
+
+bool inBrush(ivec3 c, ivec3 lo, int size, int shape) {
+    if (volMode) {   // shape tool: the voxel set is the uploaded volume
+        ivec3 v = c - pc.carve.xyz;
+        if (any(lessThan(v, ivec3(0))) || any(greaterThanEqual(v, pc.place.xyz))) return false;
+        return texelFetch(shapeVol, v, 0).r != 0u;
+    }
+    if (any(lessThan(c, lo)) || any(greaterThanEqual(c, lo + size))) return false;
+    if (shape == 1 || size <= 2) return true;
+    vec3 d = vec3(c) + 0.5 - (vec3(lo) + float(size) * 0.5);
+    float r = float(size) * 0.5;
+    return dot(d, d) <= r * r;
+}
+
+// Cell-edge darkening: `f` = position within the cell on the two in-face axes.
+float edgeMask(vec2 f, float w) {
+    vec2 e = min(f, 1.0 - f);
+    return 1.0 - smoothstep(w * 0.5, w * 1.5, min(e.x, e.y));
+}
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    if (pix.x >= pc.outRes.x || pix.y >= pc.outRes.y) return;
+    int flags = int(pc.placeCol.w);
+    if ((flags & 1) == 0) return;
+    volMode = (flags & 32) != 0;
+    const int size = pc.carve.w, shape = pc.place.w;
+    const bool onBody = (flags & 2) != 0;
+
+    vec2 ndc = (vec2(pix) + 0.5) / vec2(pc.outRes.xy) * 2.0 - 1.0;
+    float aspect = float(pc.outRes.x) / float(pc.outRes.y);
+    vec3 rd = normalize(camFwd + camRight * (ndc.x * aspect * tanHalfFov) + camUp * (ndc.y * tanHalfFov));
+    ivec2 res = textureSize(gbPos, 0);
+    ivec2 rp = clamp(ivec2((vec2(pix) + 0.5) * vec2(res) / vec2(pc.outRes.xy)), ivec2(0), res - 1);
+    vec4 posT = texelFetch(gbPos, rp, 0);
+    float tScene = posT.w < 0.0 ? 1e30 : posT.w;
+    float fpx = 2.0 * tanHalfFov / float(pc.outRes.y);   // voxels per pixel per unit distance
+
+    vec3 col = imageLoad(outImg, pix).rgb;
+    vec3 outc = col;
+
+    // --- Carve: the surface voxel under this pixel.
+    if ((flags & 4) != 0 && posT.w >= 0.0) {
+        vec3 N = texelFetch(gbNormal, rp, 0).xyz * 2.0 - 1.0;
+        vec3 Pl = (pc.worldToLocal * vec4(posT.xyz - N * 0.02, 1.0)).xyz;
+        ivec3 cell = ivec3(floor(Pl));
+        if (inBrush(cell, pc.carve.xyz, size, shape)) {
+            vec3 Nl = abs(mat3(pc.worldToLocal) * N);
+            vec3 f = fract(Pl);
+            vec2 fa = Nl.x > Nl.y && Nl.x > Nl.z ? f.yz : Nl.y > Nl.z ? f.xz : f.xy;
+            float e = edgeMask(fa, max(tScene * fpx * 1.2, 0.02));
+            if ((flags & 16) != 0) {   // paint: show the new colour on the surface
+                outc = mix(outc, pc.placeCol.rgb, 0.55);
+                outc = mix(outc, vec3(1.0), e * 0.6);
+            } else {
+                outc = mix(outc, vec3(1.0, 0.18, 0.12), 0.38);
+                outc = mix(outc, vec3(0.35, 0.02, 0.0), e * 0.8);
+            }
+        }
+    }
+
+    // --- Place: DDA through the brush box to the first empty brush cell in front of
+    // the scene.
+    if ((flags & 8) != 0) {
+        vec3 ro = (pc.worldToLocal * vec4(camPos, 1.0)).xyz;
+        vec3 rl = mat3(pc.worldToLocal) * rd;
+        vec3 srl = mix(rl, vec3(1e-6), lessThan(abs(rl), vec3(1e-6)));
+        vec3 inv = 1.0 / srl;
+        vec3 bmin = volMode ? vec3(pc.carve.xyz) : vec3(pc.place.xyz);
+        vec3 bmax = volMode ? bmin + vec3(pc.place.xyz) : bmin + float(size);
+        ivec3 boxLo = ivec3(bmin), boxHi = ivec3(bmax) - 1;
+        vec3 t0 = (bmin - ro) * inv, t1 = (bmax - ro) * inv;
+        vec3 tn = min(t0, t1), tf = max(t0, t1);
+        float tEnter = max(max(tn.x, tn.y), tn.z), tExit = min(min(tf.x, tf.y), tf.z);
+        if (tExit > max(tEnter, 0.0) && tEnter < tScene) {
+            float t = max(tEnter, 0.0);
+            ivec3 cell = clamp(ivec3(floor(ro + rl * (t + 1e-3))), boxLo, boxHi);
+            ivec3 stp = ivec3(sign(srl));
+            vec3 tMax = (vec3(cell) + step(vec3(0.0), srl) - ro) * inv;
+            vec3 tDel = abs(inv);
+            int axis = tEnter == tn.x ? 0 : tEnter == tn.y ? 1 : 2;
+            const int maxSteps = volMode ? pc.place.x + pc.place.y + pc.place.z + 3 : 3 * 40 + 3;
+            for (int i = 0; i < maxSteps; i++) {
+                if (t >= tScene - 0.02) break;
+                // World target: local == world cells, so the solidity test is exact (water
+                // counts as empty, like placement). Bodies: shown whole (no lookup).
+                bool empty = onBody || !voxelSolidAt(vec3(cell) + 0.5);
+                if (inBrush(cell, pc.place.xyz, size, shape) && empty) {
+                    vec3 Ph = ro + rl * t;
+                    vec3 f = fract(Ph);
+                    vec2 fa = axis == 0 ? f.yz : axis == 1 ? f.xz : f.xy;
+                    float e = edgeMask(fa, max(t * fpx * 1.2, 0.02));
+                    float shade = axis == 1 ? 1.0 : axis == 0 ? 0.8 : 0.65;   // readable faces
+                    outc = mix(outc, pc.placeCol.rgb * shade, 0.35);
+                    outc = mix(outc, vec3(1.0), e * 0.7);
+                    break;
+                }
+                if (tMax.x < tMax.y && tMax.x < tMax.z) { t = tMax.x; tMax.x += tDel.x; cell.x += stp.x; axis = 0; }
+                else if (tMax.y < tMax.z) { t = tMax.y; tMax.y += tDel.y; cell.y += stp.y; axis = 1; }
+                else { t = tMax.z; tMax.z += tDel.z; cell.z += stp.z; axis = 2; }
+                if (t > tExit) break;
+            }
+        }
+    }
+    if (outc != col) imageStore(outImg, pix, vec4(outc, 1.0));
+}

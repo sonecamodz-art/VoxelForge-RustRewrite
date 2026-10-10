@@ -1,0 +1,106 @@
+// Standard lighting sun shadows, step 1: ONE deterministic sun ray per pixel (world +
+// moving bodies, distance-field accelerated) + the grass-blade ray. Exact at every
+// distance: no shadow-map cascades, no resolution, so nothing can pop as you move.
+// Output shadowRaw = (visibility 0/1, distance to the blocker in voxels; 0 = sky/unlit).
+// shadow_soften.comp turns the hard edge into a penumbra sized by that distance.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rg16f, SET(3) binding = 0) uniform writeonly image2D shadowRaw;
+layout(SET(3) binding = 3) uniform sampler2D gbNormal;
+layout(SET(3) binding = 4) uniform sampler2D gbPos;
+
+BEGIN_PASS_UNIFORMS
+PASS_UNIFORMS_BODY
+END_PASS_UNIFORMS
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 res = imageSize(shadowRaw);
+    if (pix.x >= res.x || pix.y >= res.y) return;
+    vec4 posT = texelFetch(gbPos, pix, 0);
+    if (posT.w < 0.0) { imageStore(shadowRaw, pix, vec4(1.0, 0.0, 0.0, 0.0)); return; }
+    vec3 P = posT.xyz;
+    vec4 nT = texelFetch(gbNormal, pix, 0);
+    vec3 N = nT.xyz * 2.0 - 1.0;
+    // Under water the sun comes from its refracted direction (common.glsl sunUnderwater).
+#ifdef WATER_CLEAR
+    float wDepth = waterDepthAt(P + N * 0.5);
+    vec3 sunD = wDepth > 0.0 ? sunDirWater() : sunDir;
+#else
+    float wDepth = 0.0;
+    vec3 sunD = sunDir;
+#endif
+    if (dot(N, sunD) <= 0.0) {
+#ifdef FOLIAGE_SSS
+        if (isFoliageFlag(nT.a) && sunDir.y > 0.0) {   // back-lit foliage: sun through it
+#ifdef FOLIAGE_LIGHT
+            uint sd0 = 0u;
+            float lit = sunVisibility(foliageSunOrigin(posT.xyz, N, isBladeFlag(nT.a)), sunDir, lookP.w, sd0, false);
+#else
+            float lit = occludedShadow(foliageSunOrigin(posT.xyz, N, isBladeFlag(nT.a)), sunDir, 1e30, kSkipMat) ? 0.0 : 1.0;
+#endif
+            imageStore(shadowRaw, pix, vec4(lit, 0.0, 0.0, 0.0));
+            return;
+        }
+#endif
+        imageStore(shadowRaw, pix, vec4(0.0, 0.0, 0.0, 0.0));
+        return;
+    }
+    // Hybrid (r.std.hybridshadows): the cached map's 3x3 texels around P's sun column. All open
+    // above P -> lit (bodies aren't in the map: their own ray); all under an opaque occluder well
+    // above P -> shadowed, blocker distance from the map. Otherwise (edges, leaves, coarse far
+    // cascades, outside the map) the exact ray below.
+    if (optP.x > 0.0 && stdLighting != 0 && wDepth <= 0.0) {
+        vec2 l = vec2(dot(P, shRight), dot(P, shUp));
+        int c = shCascadeFor(l, 2);
+        if (c >= 0 && shTexel(c) <= 8.0) {
+            float tx = shTexel(c), zP = dot(P, sunDir);
+            ivec2 u = ivec2(floor(l / tx));
+            bool open = true, covered = true;
+            float nearOcc = 1e30;
+            for (int dy = -1; dy <= 1; dy++)
+                for (int dx = -1; dx <= 1; dx++) {
+                    float v = shFetch(c, u + ivec2(dx, dy));
+                    bool leaf = (floatBitsToUint(v) & 1u) != 0u;
+                    // where the column goes fully dark: the top, or under the leaves (shadowAux)
+                    float zBlock = leaf ? v - shFetchAux(c, u + ivec2(dx, dy)) : v;
+                    if (v > zP + 2.0 * tx + 1.0) open = false;
+                    if (zBlock < zP + 3.0 * tx + 2.0) covered = false;
+                    nearOcc = min(nearOcc, v);
+                }
+            if (covered) { imageStore(shadowRaw, pix, vec4(0.0, min(nearOcc - zP, 60000.0), 0.0, 0.0)); return; }
+            if (open) {
+                float vis = 1.0, tb = 0.0;
+                if (numObjects > 0) {
+                    Hit ob;
+                    ob.hit = false;
+                    traceObjectsInto(P + N * 3e-2, sunDir, ob, 1e30);   // (nearest: tb = ob.t is used)
+                    if (ob.hit) { vis = 0.0; tb = ob.t; }
+                }
+                if (vis > 0.0 && grassSunVis(P, N, camPos, time, prevTime) < 0.5) { vis = 0.0; tb = 0.5; }
+                imageStore(shadowRaw, pix, vec4(vis, min(tb, 60000.0), 0.0, 0.0));
+                return;
+            }
+        }
+    }
+    vec3 so = P + N * 3e-2;
+#ifdef WATER_CLEAR
+    if (wDepth > 0.0) {
+        bool blocked;
+        so = sunUnderwater(so, wDepth, blocked);
+        if (blocked) { imageStore(shadowRaw, pix, vec4(0.0, 0.5, 0.0, 0.0)); return; }
+    }
+#endif
+#ifdef FOLIAGE_LIGHT
+    uint sd0 = 0u;
+    float tb;
+    float vis = sunVisibilityT(so, sunDir, lookP.w, sd0, false, tb);   // light through leaves
+#else
+    Hit h = traceSceneShadow(so, sunDir, 1e30, kSkipMat);
+    float vis = h.hit ? 0.0 : 1.0;
+    float tb = h.hit ? h.t : 0.0;
+#endif
+    if (vis > 0.0 && grassSunVis(P, N, camPos, time, prevTime) < 0.5) { vis = 0.0; tb = 0.5; }
+    imageStore(shadowRaw, pix, vec4(vis, min(tb, 60000.0), 0.0, 0.0));
+}

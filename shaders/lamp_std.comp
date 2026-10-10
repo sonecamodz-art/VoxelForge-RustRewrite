@@ -1,0 +1,33 @@
+// Standard lighting: lamp / glowing-body light (lightsDirect: every light that matters, a
+// deterministic shadow ray each) per pixel, or per 2x2 block with r.lights.quality half —
+// then compact warps trace a quarter of the rays and shade_std upsamples the result
+// (depth / normal aware). Output rgb = lamp light in the units of `indirect`.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rgba16f, SET(3) binding = 0) uniform writeonly image2D lampOut;
+layout(SET(3) binding = 3) uniform sampler2D gbNormal;
+layout(SET(3) binding = 4) uniform sampler2D gbPos;
+
+BEGIN_PASS_UNIFORMS
+PASS_UNIFORMS_BODY
+END_PASS_UNIFORMS
+
+void main() {
+#ifdef LIGHTS_NEE
+    ivec2 o = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 res = textureSize(gbPos, 0);
+#ifdef LIGHTS_HALF
+    ivec2 outRes = (res + 1) / 2;
+    ivec2 pix = min(o * 2, res - 1);   // the block's top-left pixel
+#else
+    ivec2 outRes = res;
+    ivec2 pix = o;
+#endif
+    if (o.x >= outRes.x || o.y >= outRes.y) return;
+    vec4 posT = texelFetch(gbPos, pix, 0);
+    vec3 L = vec3(0.0);
+    if (posT.w >= 0.0) L = lightsDirect(posT.xyz, texelFetch(gbNormal, pix, 0).xyz * 2.0 - 1.0);
+    imageStore(lampOut, o, vec4(L, 0.0));
+#endif
+}

@@ -1,0 +1,32 @@
+// Clouds at half resolution: cloudMarch (common.glsl) once per 2x2 block - the ray through one of its pixels, up to
+// the farthest of its four surfaces (sky: the whole layer) - into cloudHalf = (in-scattered light, transmittance).
+// raw_shade / denoise / shade_std take it bilinearly (cloudComposite), skipping pixels whose surface is nearer than
+// the cloud layer. Each frame takes another of the block's four pixels (and the far part of the march another step
+// offset): clouds_resolve.comp accumulates them - smooth, anti-aliased voxel edges that don't flicker.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rgba16f, SET(3) binding = 0) uniform writeonly image2D cloudHalf;
+layout(SET(3) binding = 4) uniform sampler2D gbPos;
+
+BEGIN_PASS_UNIFORMS
+PASS_UNIFORMS_BODY
+END_PASS_UNIFORMS
+
+void main() {
+    ivec2 o = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 hres = imageSize(cloudHalf);
+    if (o.x >= hres.x || o.y >= hres.y) return;
+    ivec2 res = textureSize(gbPos, 0);
+    float tMax = 0.0;
+    for (int k = 0; k < 4; k++) {
+        float d = texelFetch(gbPos, min(o * 2 + ivec2(k & 1, k >> 1), res - 1), 0).w;
+        tMax = max(tMax, d < 0.0 ? 1e9 : d);
+    }
+    vec2 sampleC = vec2(o * 2) + vec2(float(frameIdx & 1u), float((frameIdx >> 1) & 1u)) + 0.5 + jitter;
+    vec2 ndc = sampleC / vec2(res) * 2.0 - 1.0;
+    float aspect = float(res.x) / float(res.y);
+    vec3 rd = normalize(camFwd + camRight * (ndc.x * aspect * tanHalfFov) + camUp * (ndc.y * tanHalfFov));
+    float jit = float(pcgHash(uint(o.x) * 1973u + uint(o.y) * 9277u + frameIdx * 26699u) & 1023u) / 1024.0;
+    imageStore(cloudHalf, o, cloudMarch(camPos, rd, tMax, jit));
+}

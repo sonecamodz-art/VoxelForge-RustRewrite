@@ -1,0 +1,42 @@
+// Standard lighting, lamp shadow cache (r.lights.cache): record one lamp's cube - for every
+// direction (6 faces x kLampCubeRes^2) the distance from the lamp's centre to the first thing
+// that blocks its light (world + bodies), out to the lamp's reach (60000 = nothing). Rays start
+// on the lamp's box (its own emissive voxels don't count), and like lightVisible a lamp's own
+// body / glowing voxels don't block it. lightVis (common.glsl) compares a point's distance with
+// this instead of tracing a shadow ray; LitRenderer re-records a lamp only when the world or a
+// body changes within its reach.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(r16f, SET(3) binding = 0) uniform writeonly image2D lampCube;
+
+BEGIN_PASS_UNIFORMS
+PASS_UNIFORMS_BODY
+END_PASS_UNIFORMS
+
+layout(push_constant) uniform PC {
+    vec4 cs;   // centre, slot
+    vec4 hr;   // half extents, reach
+    vec4 ow;   // owner body (-1 = a world light)
+} pc;
+
+void main() {
+    ivec3 id = ivec3(gl_GlobalInvocationID);
+    if (id.x >= kLampCubeRes || id.y >= kLampCubeRes) return;
+    int slot = int(pc.cs.w), owner = int(pc.ow.x);
+    vec2 st = (vec2(id.xy) + 0.5) / float(kLampCubeRes) * 2.0 - 1.0;
+    vec3 dir = normalize(lampCubeDir(id.z, st));
+    // From the lamp's centre - the point lightVisible's rays aim at; its box (merged clusters, a
+    // rotated body's world-axis box) can hold other things that must cast shadows - through its
+    // glowing voxels.
+    float t = 0.05;
+    float D = 60000.0;
+    for (int k = 0; k < 24; k++) {
+        Hit h = traceSceneLamp(pc.cs.xyz + dir * t, dir, pc.hr.w - t, kSkipMat);
+        if (!h.hit) break;
+        bool passes = owner >= 0 ? h.obj == owner : (h.obj < 0 && materials[h.mat].albedoEmissive.a >= 0.5);
+        if (!passes) { D = t + h.t; break; }
+        t += h.t + 1.0;   // through it
+    }
+    imageStore(lampCube, ivec2(id.z * kLampCubeRes + id.x, slot * kLampCubeRes + id.y), vec4(D));
+}

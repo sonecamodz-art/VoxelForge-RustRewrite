@@ -1,0 +1,67 @@
+// Bloom mip chain (PostFx). Standalone (no common.glsl). Energy-conserving, no
+// threshold (Call of Duty: AW / Jimenez 2014): every pixel contributes a little,
+// bright ones (sun glow in fog, lamps, water glints) visibly.
+//   mode 0: first downsample from the HDR image, 13-tap, Karis average (kills
+//           single-pixel fireflies that would otherwise pulse)
+//   mode 1: downsample, 13-tap
+//   mode 2: upsample (3x3 tent of the smaller level) + the same-size down level
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D srcTex;
+layout(set = 0, binding = 1) uniform sampler2D addTex;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D dstImg;
+layout(push_constant) uniform PC { int mode; float radius; float threshold; } pc;
+
+float karis(vec3 c) { return 1.0 / (1.0 + dot(c, vec3(0.2126, 0.7152, 0.0722))); }
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 res = imageSize(dstImg);
+    if (p.x >= res.x || p.y >= res.y) return;
+    vec2 uv = (vec2(p) + 0.5) / vec2(res);
+    vec3 o;
+    if (pc.mode <= 1) {
+        vec2 t = 1.0 / vec2(textureSize(srcTex, 0));
+        vec3 a = textureLod(srcTex, uv + t * vec2(-2, -2), 0.0).rgb;
+        vec3 b = textureLod(srcTex, uv + t * vec2( 0, -2), 0.0).rgb;
+        vec3 c = textureLod(srcTex, uv + t * vec2( 2, -2), 0.0).rgb;
+        vec3 d = textureLod(srcTex, uv + t * vec2(-2,  0), 0.0).rgb;
+        vec3 e = textureLod(srcTex, uv, 0.0).rgb;
+        vec3 f = textureLod(srcTex, uv + t * vec2( 2,  0), 0.0).rgb;
+        vec3 g = textureLod(srcTex, uv + t * vec2(-2,  2), 0.0).rgb;
+        vec3 h = textureLod(srcTex, uv + t * vec2( 0,  2), 0.0).rgb;
+        vec3 i = textureLod(srcTex, uv + t * vec2( 2,  2), 0.0).rgb;
+        vec3 j = textureLod(srcTex, uv + t * vec2(-1, -1), 0.0).rgb;
+        vec3 k = textureLod(srcTex, uv + t * vec2( 1, -1), 0.0).rgb;
+        vec3 l = textureLod(srcTex, uv + t * vec2(-1,  1), 0.0).rgb;
+        vec3 m = textureLod(srcTex, uv + t * vec2( 1,  1), 0.0).rgb;
+        if (pc.mode == 0) {   // Karis: weight the 5 boxes by 1/(1+luma)
+            vec3 b0 = (j + k + l + m) * 0.25, b1 = (a + b + d + e) * 0.25, b2 = (b + c + e + f) * 0.25;
+            vec3 b3 = (d + e + g + h) * 0.25, b4 = (e + f + h + i) * 0.25;
+            float w0 = karis(b0) * 0.5, w1 = karis(b1) * 0.125, w2 = karis(b2) * 0.125;
+            float w3 = karis(b3) * 0.125, w4 = karis(b4) * 0.125;
+            o = (b0 * w0 + b1 * w1 + b2 * w2 + b3 * w3 + b4 * w4) / (w0 + w1 + w2 + w3 + w4);
+        } else {
+            o = e * 0.125 + (a + c + g + i) * 0.03125 + (b + d + f + h) * 0.0625 + (j + k + l + m) * 0.125;
+        }
+        o = min(o, vec3(6.0e4));
+        // Only what is brighter than white glows (a soft knee): the sun, glints, lamps, sunlit cloud edges. Every
+        // pixel contributing blurred the whole sky into a white veil over the land (Hugo: "clear still looks foggy").
+        if (pc.mode == 0) {
+            float l = max(o.r, max(o.g, o.b)), T = pc.threshold, knee = 0.5 * T;
+            float sq = clamp(l - T + knee, 0.0, 2.0 * knee);
+            float w = max(sq * sq / (4.0 * knee + 1e-5), l - T) / max(l, 1e-5);
+            o *= w;
+        }
+    } else {
+        vec2 t = pc.radius / vec2(textureSize(srcTex, 0));
+        o = textureLod(srcTex, uv, 0.0).rgb * 4.0;
+        o += (textureLod(srcTex, uv + vec2(-t.x, 0), 0.0).rgb + textureLod(srcTex, uv + vec2(t.x, 0), 0.0).rgb +
+              textureLod(srcTex, uv + vec2(0, -t.y), 0.0).rgb + textureLod(srcTex, uv + vec2(0, t.y), 0.0).rgb) * 2.0;
+        o += textureLod(srcTex, uv + vec2(-t.x, -t.y), 0.0).rgb + textureLod(srcTex, uv + vec2(t.x, -t.y), 0.0).rgb +
+             textureLod(srcTex, uv + vec2(-t.x, t.y), 0.0).rgb + textureLod(srcTex, uv + vec2(t.x, t.y), 0.0).rgb;
+        o = o / 16.0 + textureLod(addTex, uv, 0.0).rgb;
+    }
+    imageStore(dstImg, p, vec4(o, 1.0));
+}

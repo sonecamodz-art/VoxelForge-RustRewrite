@@ -1,0 +1,148 @@
+// Pass 2.5: QUARTER-resolution volumetric fog + god rays. Marches the primary ray
+// sampling world-only sun occlusion per step (shafts brighten between casters) plus
+// distance haze. Output (scatter.rgb, transmittance.a) is bilinearly upsampled +
+// composited by the denoise/shade pass.
+//
+// TEMPORALLY REPROJECTED (Frostbite/Wronski-style): 10 march steps + a per-FRAME
+// jittered offset, blended with last frame's reprojected result, so the effective
+// sample count multiplies across frames (10 steps look like ~30-40).
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rgba16f, SET(3) binding = 0) uniform writeonly image2D fogImg;
+layout(SET(3) binding = 4) uniform sampler2D gbPos; // full-res world-pos+t (march length)
+layout(SET(3) binding = 5) uniform sampler2D fogHist;   // last frame's fog (reprojected)
+layout(SET(3) binding = 6) uniform sampler2D gbPosPrev; // last frame's full-res world-pos+t
+
+BEGIN_PASS_UNIFORMS
+PASS_UNIFORMS_BODY
+END_PASS_UNIFORMS
+
+// --- Tuning ---
+// Density, anisotropy (fogG), sun/ambient in-scatter colours, step count and
+// shadow reach are scene uniforms (Options > Lighting & Atmosphere, applyLook).
+const float kFogMaxDist     = 1400.0;  // fog cap (and sky god-ray reach)
+const float kHistory        = 0.9;     // temporal blend weight (~10-frame accumulation)
+const int   kMaxFogSteps    = 16;
+
+// Smooth 3D value noise for drifting fog wisps (r.fog.noise).
+float fogHash(vec3 p) {
+    p = fract(p * vec3(0.1031, 0.1030, 0.0973));
+    p += dot(p, p.yzx + 33.33);
+    return fract((p.x + p.y) * p.z);
+}
+float fogNoise3(vec3 p) {
+    vec3 i = floor(p), f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float n000 = fogHash(i), n100 = fogHash(i + vec3(1, 0, 0));
+    float n010 = fogHash(i + vec3(0, 1, 0)), n110 = fogHash(i + vec3(1, 1, 0));
+    float n001 = fogHash(i + vec3(0, 0, 1)), n101 = fogHash(i + vec3(1, 0, 1));
+    float n011 = fogHash(i + vec3(0, 1, 1)), n111 = fogHash(i + vec3(1, 1, 1));
+    return mix(mix(mix(n000, n100, f.x), mix(n010, n110, f.x), f.y),
+               mix(mix(n001, n101, f.x), mix(n011, n111, f.x), f.y), f.z);
+}
+// Relative fog density at a point: height fog (full below fogHeight, exponential
+// falloff above) x drifting wisps. 1.0 everywhere at the defaults.
+float fogDensityAt(vec3 p) {
+    float d = 1.0;
+    if (fogFalloff > 0.0) d = exp(-max(p.y - fogHeight, 0.0) / fogFalloff);
+    if (fogNoise > 0.0) {
+        vec3 q = p * 0.018 + vec3(time * 0.05, time * 0.012, time * 0.03);
+        float n = 0.65 * fogNoise3(q) + 0.35 * fogNoise3(q * 2.3 + 5.1);
+        d *= mix(1.0, smoothstep(0.2, 0.8, n) * 2.0, fogNoise);
+    }
+    return d;
+}
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 res = imageSize(fogImg);
+    if (pix.x >= res.x || pix.y >= res.y) return;
+
+    float aspect = float(res.x) / float(res.y);
+    vec2 uv = (vec2(pix) + 0.5) / vec2(res);
+    vec2 ndc = uv * 2.0 - 1.0;
+    vec3 rd = normalize(camFwd + camRight * (ndc.x * aspect * tanHalfFov) +
+                        camUp * (ndc.y * tanHalfFov));
+
+    // Surface distance from the full-res G-buffer (nearest matching texel).
+    ivec2 fullRes = textureSize(gbPos, 0);
+    ivec2 fp = clamp(ivec2(uv * vec2(fullRes)), ivec2(0), fullRes - 1);
+    float t = texelFetch(gbPos, fp, 0).w;
+    float marchDist = t < 0.0 ? kFogMaxDist : min(t, kFogMaxDist);
+
+    float g = fogG;
+    float cosT = dot(rd, sunDir);
+    float phase = (1.0 - g * g) /
+                  (4.0 * 3.14159265 * pow(max(1.0 + g * g - 2.0 * g * cosT, 1e-3), 1.5));
+    int steps = clamp(fogSteps, 1, kMaxFogSteps);
+    float seg = marchDist / float(steps);
+    float ign = fract(52.9829189 * fract(dot(vec2(pix), vec2(0.06711056, 0.00583715))));
+    // Per-FRAME jitter (golden-ratio offset): the temporal blend integrates the
+    // decorrelated sample positions across frames instead of banding within one.
+    // (Golden-ratio sequence in 32-bit fixed point: exact at any frame count; the
+    // float form lost its fraction after long sessions.)
+    float dither = fract(ign + float((frameIdx * 2654435769u) >> 8) * (1.0 / 16777216.0));
+    vec3 sunCol = fogSunRGB;
+
+    vec3 scatter = vec3(0.0);
+    float trans = 1.0;
+    for (int i = 0; i < kMaxFogSteps; i++) {
+        if (i >= steps) break;
+        float ti = (float(i) + dither) * seg;
+        if (ti >= marchDist) break;
+        vec3 sp = camPos + rd * ti;
+        // World-only occlusion (objects are small; skipping them keeps fog cheap).
+        // Standard lighting: the cached shadow map instead of a shadow ray.
+        float vis = stdLighting != 0 ? sunShadowHard(sp)
+            : (occludedWorldFog(sp + sunDir * 0.5, sunDir, fogShadowMax, 0u)
+                ? 0.0 : 1.0);
+        float dens = fogDensity * fogDensityAt(sp);
+        vec3 inS = (sunCol * (phase * vis) + fogAmbient * skyOpen(sp)) * (dens * seg);   // (no sky haze in caves)
+        scatter += trans * inS;
+        trans *= exp(-dens * seg);
+    }
+    vec4 cur = vec4(scatter, trans);
+
+    // Temporal reprojection: reproject this ray's march-end point through the
+    // previous camera; blend with last frame's fog if it's on-screen and the march
+    // length matches (transmittance proxy rejects disocclusions), else stay fresh.
+    vec3 P = camPos + rd * marchDist;
+    vec3 dp = P - prevCamPos;
+    float pz = dot(dp, prevCamFwd);
+    if (pz > 0.05 && frameIdx > 0u) {
+        vec2 puv = vec2(dot(dp, prevCamRight) / (pz * prevTanHalfFov * aspect),
+                        dot(dp, prevCamUp) / (pz * prevTanHalfFov)) * 0.5 + 0.5;
+        if (all(greaterThanEqual(puv, vec2(0.0))) && all(lessThan(puv, vec2(1.0)))) {
+            // History from the 4 surrounding texels, each validated on depth: the march
+            // length last frame's texel had (gbPosPrev at its centre) vs the distance
+            // from the previous camera to this march's end. A plain bilinear fetch mixed
+            // a near leaf's fog with the background's at every silhouette -> a halo that
+            // flickered as the per-frame jitter moved the edge.
+            ivec2 pres = textureSize(gbPosPrev, 0);
+            vec2 hf = puv * vec2(res) - 0.5;
+            ivec2 hb = ivec2(floor(hf));
+            vec2 hfr = hf - vec2(hb);
+            float want = min(length(dp), kFogMaxDist);
+            float sig = 0.03 * want + 1.0;
+            vec4 hSum = vec4(0.0);
+            float wSum = 0.0;
+            for (int k = 0; k < 4; k++) {
+                ivec2 q = clamp(hb + ivec2(k & 1, k >> 1), ivec2(0), res - 1);
+                float wb = ((k & 1) != 0 ? hfr.x : 1.0 - hfr.x) * ((k >> 1) != 0 ? hfr.y : 1.0 - hfr.y);
+                float pl = texelFetch(gbPosPrev, clamp(q * 4 + 2, ivec2(0), pres - 1), 0).w;
+                pl = pl < 0.0 ? kFogMaxDist : min(pl, kFogMaxDist);
+                float e = (pl - want) / sig;
+                float w = wb * exp(-e * e);
+                hSum += texelFetch(fogHist, q, 0) * w;
+                wSum += w;
+            }
+            if (wSum > 0.05) {
+                vec4 h = hSum / wSum;
+                float w = kHistory * exp(-abs(cur.a - h.a) * 6.0) * min(wSum * 2.0, 1.0);
+                cur = mix(cur, h, w);
+            }
+        }
+    }
+    imageStore(fogImg, pix, cur);
+}

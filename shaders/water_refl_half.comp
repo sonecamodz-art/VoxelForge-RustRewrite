@@ -1,0 +1,44 @@
+// Transparent water, half-res reflections (r.water.reflect.half): the mirror ray of water_refl.comp
+// traced once per 2x2 block - from the block's first water-surface pixel - into reflHalf =
+// (reflected radiance, that pixel's surface distance; 0 = no water surface in the block).
+// water_refl.comp upsamples it depth-aware and adds its own per-pixel Fresnel, glint and in-scatter.
+// The reflection is the costly part of the water (a scene ray + a sun test + lamps at the hit).
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rgba16f, SET(3) binding = 0) uniform writeonly image2D reflHalf;
+layout(SET(3) binding = 1) uniform sampler2D gbWater;
+layout(SET(3) binding = 4) uniform sampler2D gbPos;
+
+BEGIN_PASS_UNIFORMS
+PASS_UNIFORMS_BODY
+END_PASS_UNIFORMS
+
+#ifndef WATER_CLEAR
+void main() {}
+#else
+void main() {
+    ivec2 o = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 hres = imageSize(reflHalf);
+    if (o.x >= hres.x || o.y >= hres.y) return;
+    ivec2 res = textureSize(gbPos, 0);
+    ivec2 pix = ivec2(-1);
+    vec4 wv = vec4(0.0);
+    for (int k = 0; k < 4 && pix.x < 0; k++) {
+        ivec2 p = min(o * 2 + ivec2(k & 1, k >> 1), res - 1);
+        vec4 w = texelFetch(gbWater, p, 0);
+        if (w.x > 0.0 && w.y >= 0.0) { pix = p; wv = w; }   // a surface seen from above
+    }
+    if (pix.x < 0) { imageStore(reflHalf, o, vec4(0.0)); return; }
+    gWaterClarity = waterP.x; gWaterMurk = underP.y; gWave = waveP;
+    vec2 sampleC = vec2(pix) + 0.5 + jitter;   // same ray as gbuffer.comp
+    vec2 ndc = sampleC / vec2(res) * 2.0 - 1.0;
+    float aspect = float(res.x) / float(res.y);
+    vec3 rd = normalize(camFwd + camRight * (ndc.x * aspect * tanHalfFov) + camUp * (ndc.y * tanHalfFov));
+    float tS = texelFetch(gbPos, pix, 0).w;
+    vec3 Nw = vec3(wv.z, sqrt(max(1.0 - wv.z * wv.z - wv.w * wv.w, 0.0)), wv.w);
+    vec3 origin = camPos + rd * tS + Nw * 0.05;
+    bool useMap = stdLighting != 0 && optP.x > 0.0;
+    imageStore(reflHalf, o, vec4(reflRadiance(origin, rd, Nw, useMap, waterP.w, time), max(tS, 1e-3)));
+}
+#endif

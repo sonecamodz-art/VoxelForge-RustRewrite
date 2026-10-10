@@ -1,0 +1,123 @@
+// Floating dust motes in sunlight, drawn over the final image (after every denoiser /
+// upscaler, like brush_preview.comp — so DLSS never smears them and they never enter
+// temporal history).
+//
+// A camera-relative 3D grid of 2-voxel cells near the camera: a fraction of the cells
+// (r.dust.density) hold one mote at a hashed spot, bobbing slowly on its own three
+// sine phases (they never leave their cell, so nothing pops). Per pixel, a short DDA
+// along the view ray through that grid (up to the scene depth) sums the motes it
+// passes close to. Dust is everywhere, but you only SEE it in a beam: a sunlit mote
+// against shade. So a mote shows only if (1) the sun reaches it (one shadow ray, only
+// for pixels that cover a mote), (2) it is IN A BEAM: two short sun rays from beside it
+// — if its surroundings are all sunlit (open field) it is nearly invisible, and
+// (3) the image behind it is dark. Brightness follows the god rays (their colour and
+// strength, the fog density where it floats, forward scattering toward the sun).
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rgba8, SET(3) binding = 0) uniform image2D outImg;   // final LDR image (in place)
+layout(SET(3) binding = 4) uniform sampler2D gbPos;
+
+BEGIN_PASS_UNIFORMS
+PASS_UNIFORMS_BODY
+END_PASS_UNIFORMS
+
+layout(push_constant) uniform PC { ivec4 outRes; } pc;
+
+const float kCell = 2.0;       // voxels per grid cell
+const float kReach = 28.0;     // motes are drawn this far from the camera
+const int kSteps = 30;
+
+uint dHash(ivec3 c) {
+    return pcgHash(uint(c.x & 0x7FFF) * 73856093u ^ uint(c.y) * 19349663u ^ uint(c.z & 0x7FFF) * 83492791u);   // (2-voxel cells wrapped at the origin step: rebase-proof)
+}
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    if (pix.x >= pc.outRes.x || pix.y >= pc.outRes.y) return;
+    const float amount = lookP.y, density = lookP.z;
+    if (amount <= 0.0 || sunDir.y <= 0.0) return;
+    // Invisible against a bright background (sunlit field, sky): its weight below is exactly 0 there - skip
+    // the march (and its shadow rays) instead of computing glow to multiply by 0.
+    vec3 col0 = imageLoad(outImg, pix).rgb;
+    if (dot(col0, vec3(0.2126, 0.7152, 0.0722)) >= 0.75) return;
+
+    vec2 ndc = (vec2(pix) + 0.5) / vec2(pc.outRes.xy) * 2.0 - 1.0;
+    float aspect = float(pc.outRes.x) / float(pc.outRes.y);
+    vec3 rd = normalize(camFwd + camRight * (ndc.x * aspect * tanHalfFov) + camUp * (ndc.y * tanHalfFov));
+    ivec2 res = textureSize(gbPos, 0);
+    ivec2 rp = clamp(ivec2((vec2(pix) + 0.5) * vec2(res) / vec2(pc.outRes.xy)), ivec2(0), res - 1);
+    float tScene = texelFetch(gbPos, rp, 0).w;
+    float tEnd = min(tScene < 0.0 ? 1e30 : tScene, kReach);
+    float pxAngle = 2.0 * tanHalfFov / float(pc.outRes.y);   // radians per pixel
+
+    // DDA through the mote grid.
+    vec3 g = camPos / kCell;
+    vec3 srd = mix(rd, vec3(1e-6), lessThan(abs(rd), vec3(1e-6)));
+    ivec3 cell = ivec3(floor(g));
+    ivec3 stp = ivec3(sign(srd));
+    vec3 inv = 1.0 / srd;
+    vec3 tMax = ((vec3(cell) + step(vec3(0.0), srd)) - g) * inv * kCell;
+    vec3 tDel = abs(inv) * kCell;
+    float tCell = 0.0;
+    float phaseSun = pow(max(dot(rd, sunDir), 0.0), 8.0);
+    vec3 glow = vec3(0.0);
+    for (int i = 0; i < kSteps && tCell < tEnd; i++) {
+        uint h = dHash(cell);
+        if (float(h & 0xFFFFu) * (1.0 / 65535.0) < density) {
+            uint h2 = pcgHash(h);
+            vec3 base = vec3(float(h2 & 255u), float((h2 >> 8) & 255u), float((h2 >> 16) & 255u)) / 255.0;
+            vec3 ph = base * 6.2831853;
+            vec3 wob = 0.28 * vec3(sin(time * 0.31 + ph.x), sin(time * 0.23 + ph.y), sin(time * 0.27 + ph.z));
+            vec3 p = (vec3(cell) + 0.2 + 0.6 * base + wob) * kCell;
+            float tp = dot(p - camPos, rd);
+            if (tp > 0.4 && tp < tEnd) {
+                // A tiny irregular FLAKE, not a disc: an ellipse (random orientation,
+                // 1-3x aspect) of ~0.015 voxel, never drawn below ~0.6 px (then dimmed,
+                // not grown), which tumbles — catching the light now and then (glint).
+                vec3 off = (camPos + rd * tp) - p;
+                vec2 o2 = vec2(dot(off, camRight), dot(off, camUp));
+                uint h3 = pcgHash(h2);
+                float ang = float(h3 & 255u) * (6.2831853 / 256.0) + time * (0.2 + 0.3 * base.z);
+                float aspect2 = 1.0 + 2.0 * float((h3 >> 8) & 255u) / 255.0;
+                vec2 e = vec2(cos(ang) * o2.x + sin(ang) * o2.y, -sin(ang) * o2.x + cos(ang) * o2.y);
+                e.x /= aspect2;
+                float d = length(e);
+                const float kSize = 0.015;
+                float r = max(kSize, tp * pxAngle * 0.6);
+                if (d < r) {
+                    float cov = 1.0 - smoothstep(0.35 * r, r, d);
+                    float energy = (kSize * kSize) / (r * r);
+                    energy *= 0.35 + 2.0 * pow(0.5 + 0.5 * sin(time * (1.3 + 2.0 * base.x) + ph.y * 3.0), 6.0);
+                    if (!occludedShadow(p, sunDir, 1e30, kSkipMat)) {
+                        // In a beam? Shade beside it (either side, across the sun
+                        // direction) = a shaft; all lit = open air, nearly invisible.
+                        vec3 t1, t2;
+                        makeBasis(sunDir, t1, t2);
+                        float shade = (occludedShadow(p + t1 * 1.8, sunDir, 1e30, kSkipMat) ? 1.0 : 0.0) +
+                                      (occludedShadow(p - t2 * 1.8, sunDir, 1e30, kSkipMat) ? 1.0 : 0.0);
+                        float beam = mix(0.02, 1.0, min(shade, 1.0));
+                        // Fog density where it floats (height fog) — motes live where the
+                        // god rays live.
+                        float dens = fogFalloff > 0.0 ? exp(-max(p.y - fogHeight, 0.0) / fogFalloff) : 1.0;
+                        dens *= clamp(fogDensity / 0.0012, 0.25, 3.0);
+                        // Fade out far away, and in from ~1.5 voxels (a mote at the
+                        // lens would be a big soft blob).
+                        float fade = (1.0 - smoothstep(kReach * 0.6, kReach, tp)) * smoothstep(1.5, 4.0, tp);
+                        glow += fogSunRGB * 1.6 * cov * energy * fade * beam * dens * (0.5 + 5.0 * phaseSun);
+                    }
+                }
+            }
+        }
+        if (tMax.x < tMax.y && tMax.x < tMax.z) { tCell = tMax.x; tMax.x += tDel.x; cell.x += stp.x; }
+        else if (tMax.y < tMax.z) { tCell = tMax.y; tMax.y += tDel.y; cell.y += stp.y; }
+        else { tCell = tMax.z; tMax.z += tDel.z; cell.z += stp.z; }
+    }
+    if (glow.x + glow.y + glow.z <= 1e-4) return;
+    vec3 col = col0;
+    // Invisible against a bright background (sunlit field, sky).
+    float bg = dot(col, vec3(0.2126, 0.7152, 0.0722));
+    glow *= 1.0 - smoothstep(0.3, 0.75, bg);
+    col += (vec3(1.0) - col) * min(glow * exposure * amount * 0.7, vec3(1.0));   // screen blend
+    imageStore(outImg, pix, vec4(col, 1.0));
+}

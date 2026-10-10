@@ -1,0 +1,20 @@
+// Radiance cache (r.gi.cache, common.glsl GI_CACHE): one ray per cell that was used last frame - from
+// the point (and normal) of the lookup that queued it, bounce 2's own rays (one bounce: its sky, or its
+// hit's emission + direct sun). Indirect dispatch: gi_cache_resolve.comp sized it.
+
+layout(local_size_x = 64) in;
+
+void main() {
+#ifdef GI_CACHE
+    uint f = uint(giCacheP.x);
+    uint q = (f + 1u) & 1u;   // last frame's queue
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= min(gcCount[q], uint(giCacheP.w))) return;
+    GiCacheReq r = gcReq[q * kGiCacheQueueMax + i];
+    int idx = int(floatBitsToUint(r.p.w));
+    vec3 N = r.n.xyz;
+    uint seed = pcgHash(i + pcgHash(f ^ 0x2c1b3c6du));
+    vec3 dir = cosineHemisphere(N, seed);
+    giCacheAdd(idx, giPathImpl(r.p.xyz, N, dir, seed, 1, false));
+#endif
+}

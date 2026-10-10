@@ -1,0 +1,29 @@
+// Froxel fog, pass 0: the FARTHEST surface distance in each froxel tile (8x8 pixels,
+// sky = the fog cap). froxel_inject.comp skips the sun ray for froxels behind it: no
+// pixel of that tile can ever see them (in caves and forests that's most of the volume).
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(r32f, SET(3) binding = 0) uniform writeonly image2D tileDepth;
+layout(SET(3) binding = 4) uniform sampler2D gbPos;
+
+BEGIN_PASS_UNIFORMS
+PASS_UNIFORMS_BODY
+END_PASS_UNIFORMS
+
+void main() {
+    ivec2 t = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dims = imageSize(tileDepth);
+    if (t.x >= dims.x || t.y >= dims.y) return;
+    ivec2 res = textureSize(gbPos, 0);
+    // Tile t covers the pixels whose froxel uv falls in it (uv = (pix + 0.5) / res).
+    ivec2 p0 = ivec2(floor(vec2(t) * vec2(res) / vec2(dims)));
+    ivec2 p1 = min(ivec2(ceil(vec2(t + 1) * vec2(res) / vec2(dims))), res);
+    float dmax = 0.0;
+    for (int y = p0.y; y < p1.y; y++)
+        for (int x = p0.x; x < p1.x; x++) {
+            float d = texelFetch(gbPos, ivec2(x, y), 0).w;
+            dmax = max(dmax, d < 0.0 ? 1e30 : d);
+        }
+    imageStore(tileDepth, t, vec4(dmax));
+}

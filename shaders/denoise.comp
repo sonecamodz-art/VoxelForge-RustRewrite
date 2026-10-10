@@ -1,0 +1,235 @@
+// Pass 3: edge-aware spatial denoise of the accumulated shadow/AO, then shade.
+// Gathers a neighborhood of the history buffer weighted by normal + plane
+// distance (so blur never crosses edges). The blur radius shrinks as a pixel's
+// temporal history grows: freshly disoccluded pixels (few frames) get heavy
+// smoothing to hide 1-spp noise; converged pixels stay crisp. This is the
+// spatial half of an SVGF-style denoiser.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rgba8, SET(3) binding = 0) uniform writeonly image2D outImg;
+#ifdef DLSS_GUIDES
+// Pre-tonemap linear HDR radiance — DLSS Ray Reconstruction's COLOR_IN. VK-only.
+layout(rgba16f, SET(3) binding = 1) uniform writeonly image2D gbColorHDR;
+#endif
+
+layout(SET(3) binding = 2) uniform sampler2D gbAlbedo;
+layout(SET(3) binding = 3) uniform sampler2D gbNormal;
+layout(SET(3) binding = 4) uniform sampler2D gbPos;
+layout(SET(3) binding = 6) uniform sampler2D histCur; // shadow, shadowM2, count
+layout(SET(3) binding = 7) uniform sampler2D giHist;  // HALF-res à-trous-filtered 1-bounce GI
+layout(SET(3) binding = 9) uniform usampler2D giGuide; // half-res filter guide (common.glsl)
+layout(SET(3) binding = 10) uniform sampler2D shadowSoft; // r.svgf.shadow soft: final sun visibility
+layout(SET(3) binding = 11) uniform sampler2D giHistLen;  // half-res GI history (.a = frames)
+#ifdef WATER_CLEAR
+layout(SET(3) binding = 20) uniform sampler2D cloudHalf;  // clouds.comp (half res)
+layout(SET(3) binding = 16) uniform sampler2D gbDelta;    // .a = body + 1 (self-occlusion)
+layout(SET(3) binding = 12) uniform sampler2D gbWater;    // in-water path, bed depth (gbuffer.comp)
+#endif
+#if defined(WATER_CLEAR) || defined(REFL_GLOSSY)   // (also glossy surfaces' reflections)
+layout(SET(3) binding = 13) uniform sampler2D waterAdd;   // reflection + glint + in-scatter (water_refl.comp)
+#endif
+
+layout(SET(3) binding = 17) uniform sampler2D gbSurf;     // roughness, metalness, bump (gbuffer.comp)
+
+BEGIN_PASS_UNIFORMS
+PASS_UNIFORMS_BODY
+END_PASS_UNIFORMS
+
+layout(SET(3) binding = 5) uniform sampler2D fogTex; // quarter-res (scatter.rgb, transmittance.a)
+layout(SET(3) binding = 14) uniform sampler3D froxelVol;   // integrated froxel fog (r.fog.method froxel)
+#ifdef DEBUG_HEAT
+layout(SET(3) binding = 8) uniform sampler2D dbgHeat;   // x = primary steps, y = shadow steps
+#endif
+
+
+// Joint-bilateral upsample of the half-res 1-bounce GI. Bilinearly weight the 4
+// covering half-res texels, but stop the blend across depth/normal edges (using
+// each half-res texel's representative full-res position) so indirect light never
+// bleeds past a silhouette. GI is low-frequency, so this reconstructs a full-res
+// term from quarter the traces with no visible softness.
+vec3 giUpsample(ivec2 pix, vec3 P, vec3 N, float depth, ivec2 res) {
+    ivec2 hres = (res + 1) / 2;
+    vec2 hf = vec2(pix) * 0.5 - 0.25; // full-res pixel center in half-res texel space
+    ivec2 base = ivec2(floor(hf));
+    vec2 f = hf - vec2(base);
+    vec3 acc = vec3(0.0);
+    float wSum = 0.0;
+    for (int dy = 0; dy < 2; dy++)
+        for (int dx = 0; dx < 2; dx++) {
+            ivec2 hq = clamp(base + ivec2(dx, dy), ivec2(0), hres - 1);
+            float wb = (dx == 0 ? 1.0 - f.x : f.x) * (dy == 0 ? 1.0 - f.y : f.y);
+            Guide gq = unpackGuide(texelFetch(giGuide, hq, 0));
+            if (gq.sky) continue; // half-res texel sat on sky
+            vec4 qp = vec4(gq.P, 0.0);
+            vec3 qn = gq.N;
+            float wN = pow(max(dot(N, qn), 0.0), 16.0);
+            float planeD = abs(dot(qp.xyz - P, N));
+            float wP = exp(-planeD / (0.4 + depth * 0.004));
+            // When every edge weight fails, fall back to this pixel's OWN half-res texel
+            // (always geometry now: its representative is the first non-sky texel), not
+            // to a plain bilinear blend across the edge.
+            float w = wb * wN * wP + (hq == pix / 2 ? 1e-4 : 0.0);
+            acc += texelFetch(giHist, hq, 0).rgb * w;
+            wSum += w;
+        }
+    if (wSum <= 0.0) return texelFetch(giHist, min(pix / 2, hres - 1), 0).rgb;
+    return acc / wSum;
+}
+
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    // Render resolution (== outImg size unless DLSS-SR upscales afterwards, in
+    // which case outImg is display-sized and only gbColorHDR is consumed).
+    ivec2 res = textureSize(gbPos, 0);
+    if (pix.x >= res.x || pix.y >= res.y) return;
+
+    float aspect = float(res.x) / float(res.y);
+    vec2 ndc = (vec2(pix) + 0.5) / vec2(res) * 2.0 - 1.0;
+    vec3 rd = normalize(camFwd + camRight * (ndc.x * aspect * tanHalfFov) +
+                        camUp * (ndc.y * tanHalfFov));
+
+    vec4 posT = texelFetch(gbPos, pix, 0);
+    bool sky = posT.w < 0.0;
+
+    // --- Base radiance (surface shade or sky), linear / pre-tonemap ---
+    vec3 base;
+    vec3 dbgColor = vec3(-1.0);   // r.debugview output (display space), -1 = none
+    if (sky) {
+        base = skyColor(rd);
+#ifdef WATER_CLEAR
+        {   // seen from under water: through the water up to the surface, plus its murk
+            vec4 wv = texelFetch(gbWater, pix, 0);
+            if (wv.x > 0.0 && wv.y < 0.0) {
+                gWaterClarity = waterP.x; gWaterMurk = underP.y; gWave = waveP;
+                // Through Snell's window: gbuffer.comp left the refracted direction in gbNormal.
+                vec4 nd = texelFetch(gbNormal, pix, 0);
+                if (dot(nd.xyz, nd.xyz) > 0.0) base = skyColor(normalize(nd.xyz * 2.0 - 1.0));
+                base = base * waterTrans(wv.x) + texelFetch(waterAdd, pix, 0).rgb;
+            }
+        }
+#endif
+    } else {
+        vec3 P = posT.xyz;
+        vec3 N = texelFetch(gbNormal, pix, 0).xyz * 2.0 - 1.0;
+        N = facetNormal(N, texelFetch(gbSurf, pix, 0));   // (per-voxel facets, gbuffer.comp)
+        vec4 alb = texelFetch(gbAlbedo, pix, 0);
+
+#ifdef SVGF_SOFT_SHADOW
+        // Deterministic: one exact ray + a penumbra filter (shadow_soften.comp).
+        float shadow = texelFetch(shadowSoft, pix, 0).r;
+        float count = texelFetch(giHistLen, min(pix / 2, (res + 1) / 2 - 1), 0).a;
+#else
+        vec4 h0 = texelFetch(histCur, pix, 0);
+        float count = h0.z;
+
+        // Wider kernel while under-converged; tight once accumulated (pixels).
+        int step = count < 4.0 ? 2 : 1;
+        int radius = count < 4.0 ? 2 : (count < 16.0 ? 2 : 1);
+
+        // Variance-guided shadow filter: blur hard where the accumulated shadow is
+        // still noisy (high variance), preserve crisp penumbra where it converged.
+        // Few-frame pixels (disocclusions) have ZERO temporal variance from a single
+        // sample, so force a wide luminance tolerance there → blur freely.
+        float sVar = max(h0.y - h0.x * h0.x, 0.0);
+        float sPhi = count < 4.0 ? 1.0 : (4.0 * sqrt(sVar) + 2e-3);
+
+        float sSum = 0.0, wSum = 0.0;
+        for (int dy = -radius; dy <= radius; dy++)
+            for (int dx = -radius; dx <= radius; dx++) {
+                ivec2 q = pix + ivec2(dx, dy) * step;
+                if (q.x < 0 || q.y < 0 || q.x >= res.x || q.y >= res.y) continue;
+                vec4 qp = texelFetch(gbPos, q, 0);
+                if (qp.w < 0.0) continue;
+                vec3 qn = texelFetch(gbNormal, q, 0).xyz * 2.0 - 1.0;
+                float sq = texelFetch(histCur, q, 0).x;
+                float wN = pow(max(dot(N, qn), 0.0), 32.0);
+                float planeD = abs(dot(qp.xyz - P, N));
+                float wP = exp(-planeD / (0.5 + posT.w * 0.003));
+                float wS = exp(-float(dx * dx + dy * dy) * 0.4);
+                float wL = exp(-abs(h0.x - sq) / sPhi);
+                float w = wN * wP * wS * wL;
+                sSum += sq * w;   // sun shadow
+                wSum += w;
+            }
+        float shadow = wSum > 0.0 ? sSum / wSum : h0.x;
+#endif
+        // 1-bounce indirect: joint-bilateral upsample of the à-trous-filtered GI.
+        vec3 indirect = giUpsample(pix, P, N, posT.w, res);
+        // A touch of crisp deterministic contact darkening on top of the (soft,
+        // ray-traced) indirect — keeps voxel seams reading without a floor.
+#ifdef AO_IN_GI
+        float contact = 1.0;   // already folded into the half-res GI (gi.comp)
+#else
+        gSelfBody = selfBodyOf(texelFetch(gbDelta, pix, 0).a);
+        float contact = 0.55 + 0.45 * voxelAO(P, N);
+#endif
+
+#ifdef WATER_CLEAR   // under water the sun arrives refracted (common.glsl sunDirWater)
+        float ndl = max(dot(N, waterLightDepth(texelFetch(gbWater, pix, 0)) > 0.0 ? sunDirWater() : sunDir), 0.0);
+#else
+        float ndl = max(dot(N, sunDir), 0.0);
+#endif
+        // Direct sun + 1-BOUNCE GI (sky fill + colored bounce + emissive spread),
+        // no fake ambient floor: sealed spaces get no indirect → basically black.
+        bool water = texelFetch(gbNormal, pix, 0).a < 0.5;
+#ifdef FOLIAGE_SSS
+        { float fa = texelFetch(gbNormal, pix, 0).a; gFoliage = isFoliageFlag(fa) ? 1.0 : 0.0; gSss = lookP.x; }
+#endif
+#ifdef WATER_CLEAR
+        // Under water: less sun / sky reaches the bed (its view absorption is in alb).
+        gWaterClarity = waterP.x; gWaterMurk = underP.y; gWave = waveP;
+        { vec4 wv = texelFetch(gbWater, pix, 0); setWaterLightAt(waterLightDepth(wv), P, time, underP.z); }   // + caustics
+#endif
+        setSurface(texelFetch(gbSurf, pix, 0));
+        base = shadeSurface(P, N, rd, alb, water, ndl, shadow, indirect, contact);
+#if defined(WATER_CLEAR) || defined(REFL_GLOSSY)
+        base += texelFetch(waterAdd, pix, 0).rgb;
+#endif
+        if (debugMode == DV_GI) dbgColor = pow(aces(indirect * contact * exposure), vec3(1.0 / 2.2));
+        else if (debugMode == DV_SHADOW) dbgColor = vec3(shadow * ndl);
+        else if (debugMode == DV_HISTORY) dbgColor = heatRamp(1.0 - count / 48.0);   // red = fresh
+        else if (debugMode == DV_ALBEDO) dbgColor = alb.rgb;
+        else if (debugMode == DV_NORMALS) dbgColor = N * 0.5 + 0.5;
+    }
+
+    // Volumetric fog + god rays: computed at quarter res in fog.comp, sampled
+    // here with a bilinear upsample. Sky stays full-brightness (it IS the far
+    // haze); surfaces fade into the fog by its transmittance.
+#ifdef FOG_FROXEL
+    vec4 fg = fogSample(froxelVol, posT.w, rd, camPos, pix, res, fogP, fogStart, vec2(hazeK, hazeSea));
+#else
+    vec4 fg = fogUpsample(fogTex, gbPos, pix, posT.w, res);
+#endif
+#if defined(FOG_FROXEL) && defined(WATER_CLEAR)
+    if (!sky) {   // under water the froxels attenuate grey; the albedo already has the per-channel part
+        vec4 wv = texelFetch(gbWater, pix, 0);
+        if (wv.x > 0.0 && wv.y < 0.0) base *= waterFroxelFix(wv.z);
+    }
+#endif
+    // clouds behind the weather fog (it hides them like the land), in front of the surface or of the sky
+    vec4 cl = cloudComposite(cloudHalf, pix, res, camPos, rd, sky ? -1.0 : posT.w);
+    vec3 linColor = (base * cl.a + cl.rgb) * fg.a + fg.rgb;   // (the sky fades into the fog like the land)
+#ifdef DLSS_GUIDES
+    imageStore(gbColorHDR, pix, vec4(linColor, 1.0));   // HDR linear for DLSS-RR
+#endif
+    // (plain SVGF shows this; with DLAA / SR, torchfx.comp adds the flames to their output instead)
+    vec3 shownColor = linColor + torchFlames(camPos, rd, sky ? 1e30 : posT.w, time);
+    if (rainA.x > 0.001) {   // (no upscaler after this pass: the rain goes in here)
+        float pixAng = 2.0 * tanHalfFov / float(res.y);
+        if (!sky) shownColor = rainSplashes(shownColor, posT.xyz, texelFetch(gbNormal, pix, 0).xyz * 2.0 - 1.0, posT.w, pixAng);
+        shownColor = rainDrops(shownColor, camPos, rd, sky ? -1.0 : posT.w, pixAng, waveP);
+    }
+    vec3 color = displayMap(shownColor * exposure, tonemapOp, saturation, contrast, whiteBalance);
+#ifdef DEBUG_HEAT
+    // Heat: DDA iterations on a log ramp (blue ~4, green ~32, red >= 256).
+    if (debugMode == DV_HEAT_PRIMARY || debugMode == DV_HEAT_SHADOW) {
+        vec2 hv = texelFetch(dbgHeat, pix, 0).xy;
+        float n = debugMode == DV_HEAT_PRIMARY ? hv.x : hv.y;
+        dbgColor = n <= 0.0 ? vec3(0.0) : heatRamp(log2(max(n, 1.0) / 4.0) / 6.0);
+    }
+#endif
+    if (dbgColor.x >= 0.0) color = dbgColor;
+    imageStore(outImg, pix, vec4(color, 1.0));
+}

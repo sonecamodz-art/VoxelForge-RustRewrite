@@ -1,0 +1,62 @@
+// The clouds accumulated over frames (as Horizon Zero Dawn's Nubis / Frostbite / RDR2 do with theirs): this frame's
+// half-resolution march (clouds.comp: another pixel of each 2x2 block and another step offset every frame) blended
+// into last frame's result, reprojected by the camera - to where the ray meets the cloud layer, so flying past near
+// clouds doesn't smear them - and clamped to the neighbourhood of this frame's samples (mean +- 1.25 sigma: no
+// ghosts when a cloud moves off or a tree uncovers sky). Bright single samples (a thin edge lit by the sun) are
+// weighted down by their brightness (Karis) so they don't sparkle. Without it a 1 m cloud voxel smaller than a pixel
+// flipped on and off between frames: the cloud edges shimmered.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rgba16f, SET(3) binding = 0) uniform writeonly image2D outHist;
+layout(SET(3) binding = 1) uniform sampler2D cur;    // clouds.comp, this frame (texelFetch)
+layout(SET(3) binding = 2) uniform sampler2D prev;   // last frame's history (bilinear)
+
+BEGIN_PASS_UNIFORMS
+PASS_UNIFORMS_BODY
+END_PASS_UNIFORMS
+
+float lumaW(vec4 c) { return 1.0 / (1.0 + dot(c.rgb, vec3(0.2126, 0.7152, 0.0722))); }
+
+void main() {
+    ivec2 o = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 hres = imageSize(outHist);
+    if (o.x >= hres.x || o.y >= hres.y) return;
+    // this frame's neighbourhood: its mean / spread, and the centre sample
+    vec4 m1 = vec4(0.0), m2 = vec4(0.0), c = vec4(0.0);
+    float wsum = 0.0;
+    for (int j = -1; j <= 1; ++j)
+        for (int i = -1; i <= 1; ++i) {
+            vec4 v = texelFetch(cur, clamp(o + ivec2(i, j), ivec2(0), hres - 1), 0);
+            m1 += v; m2 += v * v;
+            float w = (i == 0 && j == 0) ? 1.0 : 0.0;
+            c += v * w;
+        }
+    m1 /= 9.0;
+    vec4 sigma = sqrt(max(m2 / 9.0 - m1 * m1, 0.0));
+    vec4 lo = m1 - 1.25 * sigma, hi = m1 + 1.25 * sigma;
+
+    // where this texel's ray meets the clouds, seen from last frame's camera
+    vec2 res = vec2(hres * 2);
+    vec2 ndc = (vec2(o * 2) + 1.0) / res * 2.0 - 1.0;
+    float aspect = res.x / res.y;
+    vec3 rd = normalize(camFwd + camRight * (ndc.x * aspect * tanHalfFov) + camUp * (ndc.y * tanHalfFov));
+    float te = cloudEntry(camPos, rd);
+    float t = te < 1e29 ? te + 0.3 * cloudA.z / max(abs(rd.y), 0.05) : 1e6;
+    vec3 dp = camPos + rd * min(t, 1e6) - prevCamPos;
+    float pz = dot(dp, prevCamFwd);
+    vec4 outc = c;
+    if (pz > 0.0) {
+        vec2 puv = vec2(dot(dp, prevCamRight) / (pz * prevTanHalfFov * aspect), dot(dp, prevCamUp) / (pz * prevTanHalfFov)) * 0.5 + 0.5;
+        if (all(greaterThanEqual(puv, vec2(0.0))) && all(lessThanEqual(puv, vec2(1.0)))) {
+            vec4 h = textureLod(prev, puv, 0.0);
+            if (h.a >= 0.0 && optP.z > 0.5) {   // (-1: no history yet; r.clouds.temporal 0: none)
+                h = clamp(h, lo, hi);
+                float a = 0.1;   // (~10 frames: the jitter's four pixels and step offsets averaged)
+                float wc = a * lumaW(c), wh = (1.0 - a) * lumaW(h);
+                outc = (c * wc + h * wh) / (wc + wh);
+            }
+        }
+    }
+    imageStore(outHist, o, outc);
+}

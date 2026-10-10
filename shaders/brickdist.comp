@@ -1,0 +1,68 @@
+// Brick-level Chebyshev (L∞) distance field over the world brick grid: for every
+// brick, the distance in bricks to the nearest NON-EMPTY brick (0 = occupied,
+// capped at DIST_CAP). Traversal (common.glsl traceVolume) uses it to jump a ray
+// out of the empty cube of radius d-1 around its current brick in one step.
+//
+// The L∞ distance transform is separable: three passes, one per axis, each taking
+// min over k in [-CAP, CAP] of max(|k|, f(c + k·axis)). Pass 0 reads the grid
+// (occupied = any non-zero entry), passes 1-2 read the previous pass. Only the box
+// [boxMin, boxMax] is (re)computed — edits rebuild dirty bricks ± CAP.
+//
+// A second, "DRY" field ignores water (rays that pass through water with r.water 1
+// skip water-only bricks with it): firstPass == 2 writes each brick's dry occupancy
+// (0 = has a solid non-water voxel, CAP = air/water only) by scanning its atlas
+// voxels; the same three axis passes then run on that.
+// Standalone (no common.glsl); compiled with an empty preamble.
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+layout(set = 0, binding = 0) uniform usampler3D src;             // grid (pass 0) or distance
+layout(set = 0, binding = 1, r8ui) uniform writeonly uimage3D dst;
+layout(set = 0, binding = 2) uniform usampler3D atlas;           // brick atlas (dry occupancy)
+
+layout(push_constant) uniform PC {
+    ivec3 boxMin; int axis;   // axis 0/1/2
+    ivec3 boxMax; int firstPass;   // 1 = grid -> occupancy + X pass, 2 = dry occupancy only
+} pc;                              // (firstPass 2: axis = atlas bricks x | y << 10)
+                                   // firstPass | 4: a streaming world - the box is in ABSOLUTE bricks
+                                   // and the textures are toroidal in x / z (wrap, no "outside")
+
+const int DIST_CAP = 16;   // must match kDistCap in vk_gpu_world.cpp
+
+void main() {
+    ivec3 c = pc.boxMin + ivec3(gl_GlobalInvocationID);
+    if (any(greaterThan(c, pc.boxMax))) return;
+    const bool ring = (pc.firstPass & 4) != 0;
+    const int firstPass = pc.firstPass & 3;
+    ivec3 dims = textureSize(src, 0);
+    if (firstPass == 2) dims = imageSize(dst);
+    ivec3 cw = ring ? ivec3(c.x & (dims.x - 1), c.y, c.z & (dims.z - 1)) : c;
+    if (firstPass == 2) {
+        uint g = texelFetch(src, cw, 0).r;
+        bool solid = g != 0u && g != 5u;
+        if (g >= 256u) {
+            uint slot = g - 256u, abx = uint(pc.axis) & 1023u, aby = uint(pc.axis) >> 10;
+            ivec3 base = ivec3(slot % abx, (slot / abx) % aby, slot / (abx * aby)) * 8;
+            solid = false;
+            for (int i = 0; i < 512 && !solid; i++) {
+                uint m = texelFetch(atlas, base + ivec3(i & 7, (i >> 3) & 7, i >> 6), 0).r;
+                solid = m != 0u && m != 5u;
+            }
+        }
+        imageStore(dst, cw, uvec4(solid ? 0u : uint(DIST_CAP)));
+        return;
+    }
+    ivec3 ax = ivec3(pc.axis == 0, pc.axis == 1, pc.axis == 2);
+    uint best = uint(DIST_CAP);
+    for (int k = -DIST_CAP; k <= DIST_CAP; k++) {
+        ivec3 q = c + ax * k;
+        if (ring) {
+            if (q.y < 0 || q.y >= dims.y) continue;                                     // above / below = empty
+            q = ivec3(q.x & (dims.x - 1), q.y, q.z & (dims.z - 1));
+        } else if (any(lessThan(q, ivec3(0))) || any(greaterThanEqual(q, dims))) continue;  // outside = empty
+        uint v = texelFetch(src, q, 0).r;
+        uint f = firstPass != 0 ? (v != 0u ? 0u : uint(DIST_CAP)) : v;
+        best = min(best, max(uint(abs(k)), f));
+    }
+    imageStore(dst, cw, uvec4(best));
+}

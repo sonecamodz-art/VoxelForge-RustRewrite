@@ -1,0 +1,246 @@
+// DLSS-RR COLOR_IN: raw 1-spp noisy HDR radiance (no temporal, no SVGF). Casts
+// one jittered sun-shadow ray + one 1-bounce GI ray per pixel and shades, then
+// composites the (quarter-res) fog. DLSS-RR does the temporal denoising itself
+// from this + the motion vectors, which is what avoids the ghosting you get from
+// feeding it an already-accumulated image. VK-only (uses common.glsl helpers).
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rgba16f, SET(3) binding = 0) uniform writeonly image2D outColor; // HDR linear
+layout(SET(3) binding = 2) uniform sampler2D gbAlbedo;
+layout(SET(3) binding = 3) uniform sampler2D gbNormal;
+layout(SET(3) binding = 4) uniform sampler2D gbPos;
+layout(SET(3) binding = 5) uniform sampler2D fogTex;   // quarter-res, bilinear
+layout(SET(3) binding = 14) uniform sampler3D froxelVol;   // integrated froxel fog (r.fog.method froxel)
+layout(SET(3) binding = 6) uniform sampler2D rawGi;    // half-res GI (raw_gi.comp)
+// Lamp weights for raw_lamps.comp (lamps are added in their own pass): rgb = what lamp light is
+// multiplied by in this pixel's colour (albedo x GI scale x contact x fog transmittance), a = the
+// sun + sky floor below which a lamp isn't traced (gLightFloor). 0 = no lamp light here.
+layout(rgba16f, SET(3) binding = 7) uniform writeonly image2D lampW;
+// NVIDIA NRD (r.denoiser nrd, vk_nrd_path.cpp). NRD_SPLIT: the same rays as RR, but instead of shading,
+// the noisy signals go out for denoising - outColor (binding 0) = indirect radiance before albedo + the
+// bounce ray's hit distance (voxels), sunSig = sun visibility, its first blocker's distance, the grass
+// blades' (deterministic) visibility, a sun-ray flag. NRD_COMPOSE: no rays; NRD's denoised signals
+// (REBLUR: YCoCg indirect, SIGMA: sqrt-packed sun visibility; optP.z bits 1 / 2: the raw indirect / sun) are
+// shaded exactly like RR's (shadeSurface, contact AO, water, fog).
+#ifdef NRD_SPLIT
+layout(rgba16f, SET(3) binding = 8) uniform writeonly image2D sunSig;
+#endif
+#ifdef NRD_COMPOSE
+layout(SET(3) binding = 8) uniform sampler2D sunSigTex;     // (.z grass blades, .w lit)
+layout(SET(3) binding = 9) uniform sampler2D nrdDiff;       // REBLUR OUT_DIFF_RADIANCE_HITDIST (or the raw signal)
+layout(SET(3) binding = 10) uniform sampler2D nrdSun;       // SIGMA OUT_SHADOW_TRANSLUCENCY (or the raw signal)
+layout(SET(3) binding = 11) uniform sampler2D nrdValid;     // NRD's validation overlay (r.nrd.debug: underP.w = 1)
+#endif
+#ifdef WATER_CLEAR
+layout(SET(3) binding = 20) uniform sampler2D cloudHalf;  // clouds.comp (half res)
+layout(SET(3) binding = 16) uniform sampler2D gbDelta;    // .a = body + 1 (self-occlusion)
+layout(SET(3) binding = 12) uniform sampler2D gbWater;    // in-water path, bed depth (gbuffer.comp)
+#endif
+#if defined(WATER_CLEAR) || defined(REFL_GLOSSY)   // (also glossy surfaces' reflections)
+layout(SET(3) binding = 13) uniform sampler2D waterAdd;   // reflection + glint + in-scatter (water_refl.comp)
+#endif
+
+layout(SET(3) binding = 17) uniform sampler2D gbSurf;     // roughness, metalness, bump (gbuffer.comp)
+
+BEGIN_PASS_UNIFORMS
+PASS_UNIFORMS_BODY
+END_PASS_UNIFORMS
+
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 res = imageSize(outColor);
+    if (pix.x >= res.x || pix.y >= res.y) return;
+
+    float aspect = float(res.x) / float(res.y);
+    vec2 ndc = (vec2(pix) + 0.5) / vec2(res) * 2.0 - 1.0;
+    vec3 rd = normalize(camFwd + camRight * (ndc.x * aspect * tanHalfFov) +
+                        camUp * (ndc.y * tanHalfFov));
+
+    vec4 posT = texelFetch(gbPos, pix, 0);
+    bool sky = posT.w < 0.0;
+    vec3 base;
+    vec3 lampAlb = vec3(0.0);   // (raw_lamps.comp's weights)
+    bool lampWater = true;
+    float lampFloorOut = 0.0;
+    if (sky) {
+#ifdef NRD_SPLIT
+        imageStore(outColor, pix, vec4(0.0));
+        imageStore(sunSig, pix, vec4(0.0));
+        imageStore(lampW, pix, vec4(0.0));
+        return;
+#endif
+        base = skyColor(rd);
+#ifdef WATER_CLEAR
+        {   // seen from under water: through the water up to the surface, plus its murk
+            vec4 wv = texelFetch(gbWater, pix, 0);
+            if (wv.x > 0.0 && wv.y < 0.0) {
+                gWaterClarity = waterP.x; gWaterMurk = underP.y; gWave = waveP;
+                // Through Snell's window: gbuffer.comp left the refracted direction in gbNormal.
+                vec4 nd = texelFetch(gbNormal, pix, 0);
+                if (dot(nd.xyz, nd.xyz) > 0.0) base = skyColor(normalize(nd.xyz * 2.0 - 1.0));
+                base = base * waterTrans(wv.x) + texelFetch(waterAdd, pix, 0).rgb;
+            }
+        }
+#endif
+    } else {
+        vec3 P = posT.xyz;
+        vec3 N = texelFetch(gbNormal, pix, 0).xyz * 2.0 - 1.0;
+        N = facetNormal(N, texelFetch(gbSurf, pix, 0));   // (per-voxel facets, gbuffer.comp)
+        vec4 alb = texelFetch(gbAlbedo, pix, 0);
+        uint seed = pixelSeed(pix, frameIdx, 0u);
+
+        // Direct sun: one jittered shadow ray (objects included). Under water: the refracted
+        // sun, from where its light came in (common.glsl sunUnderwater).
+#ifdef WATER_CLEAR
+        gWaterClarity = waterP.x; gWaterMurk = underP.y; gWave = waveP;
+        float wDepth = waterLightDepth(texelFetch(gbWater, pix, 0));
+        float ndl = max(dot(N, wDepth > 0.0 ? sunDirWater() : sunDir), 0.0);
+#else
+        float wDepth = 0.0;
+        float ndl = max(dot(N, sunDir), 0.0);
+#endif
+        // One sun-visibility call site for both cases (a lit face, or a back-lit leaf / blade: the sun
+        // reaching it from behind, transmission): each call site inlined a whole traversal loop, and
+        // that code weighed on every pixel's occupancy. Same rays and random numbers as two sites.
+        float shadow = 0.0;
+        bool sunRay = ndl > 0.0, lit = ndl > 0.0;
+#ifdef NRD_SPLIT
+        float sunT = 0.0, grassV = 1.0;   // first blocker's distance, the blades' visibility
+#endif
+        vec3 so = P + N * 3e-2;
+#ifdef FOLIAGE_SSS
+        if (!lit) {
+            float fa = texelFetch(gbNormal, pix, 0).a;
+            if (isFoliageFlag(fa) && sunDir.y > 0.0) { sunRay = true; so = foliageSunOrigin(P, N, isBladeFlag(fa)); }
+        }
+#endif
+#ifdef NRD_COMPOSE
+        {   // the denoised sun (blades' shadows are deterministic: multiplied after denoising)
+            vec4 sg = texelFetch(sunSigTex, pix, 0);
+            bool rawSun = (int(optP.z) & 2) != 0;
+            float vis = rawSun ? sg.x : texelFetch(nrdSun, pix, 0).y;
+            if (!rawSun) vis *= vis;   // (SIGMA_BackEnd_UnpackShadow; .yzw = the light let through)
+            shadow = sunRay ? vis * sg.z : 0.0;
+        }
+        if (false) {
+#else
+        if (sunRay) {
+#endif
+            vec3 sd = sampleCone(sunDir, sunAngle, seed);
+            bool blocked = false;
+#ifdef WATER_CLEAR
+            if (lit && wDepth > 0.0) so = sunUnderwater(so, wDepth, blocked);
+#endif
+#if defined(FOLIAGE_LIGHT) && defined(NRD_SPLIT)
+            // (NRD: leaves / blades pass their light fraction deterministically - the same mean as the
+            // stochastic pass-or-block, without its per-ray coin flip, which shows as grain in crowns / grass)
+            shadow = blocked ? 0.0 : sunVisibilityT(so, sd, lookP.w, seed, false, sunT);
+            if (blocked) sunT = 0.5;
+#elif defined(FOLIAGE_LIGHT)
+            shadow = blocked ? 0.0 : sunVisibility(so, sd, lookP.w, seed, true);   // light through leaves
+#else
+            shadow = blocked || occludedShadow(so, sd, 1e30, kSkipMat) ? 0.0 : 1.0;
+#endif
+#ifdef NRD_SPLIT
+            if (lit && shadow > 0.0) grassV = grassSunVis(P, N, camPos, time, prevTime);   // (kept apart)
+#else
+            if (lit && shadow > 0.0) shadow *= grassSunVis(P, N, camPos, time, prevTime);   // blade shadows
+#endif
+        }
+
+#ifdef LIGHTS_NEE
+        float lampFloor = lightFloorAt(P, N, ndl * shadow);   // (lamps too dim to see here: no shadow ray)
+#endif
+#if defined(NRD_COMPOSE)
+        vec3 indirect = texelFetch(nrdDiff, pix, 0).rgb;
+        if ((int(optP.z) & 1) == 0) {   // REBLUR_BackEnd_UnpackRadianceAndNormHitDist: YCoCg -> linear
+            float t = indirect.x - indirect.z;
+            indirect = max(vec3(t + indirect.y, indirect.x + indirect.z, t - indirect.y), vec3(0.0));
+        }
+#elif defined(NRD_SPLIT)
+        vec3 indirect = giBounceL(P, N, seed, false);   // (always full res; lamps: raw_lamps.comp)
+#elif defined(RR_SPARSE_GI)
+        // Sparse but UNBIASED: only 1 in RR_SPARSE_GI pixels traces the GI ray (a
+        // pattern that rotates every frame), weighted up by that factor; the rest
+        // contribute 0. DLSS-RR sees honest per-pixel noise (no copied blocks).
+        vec3 indirect = vec3(0.0);
+#if RR_SPARSE_GI == 2
+        bool take = ((pix.x + pix.y + int(frameIdx)) & 1) == 0;
+#else
+        ivec2 o4 = ivec2(frameIdx & 1u, (frameIdx >> 1u) & 1u);
+        bool take = (pix & 1) == o4;
+#endif
+        if (take) indirect = giBounceL(P, N, seed, false) * float(RR_SPARSE_GI);
+#elif defined(RR_HALF_GI)
+        // 1-bounce GI traced at half res (raw_gi.comp); nearest fetch of this 2x2 block.
+        vec3 indirect = texelFetch(rawGi, min(pix / 2, textureSize(rawGi, 0) - 1), 0).rgb;
+#else
+        vec3 indirect = giBounceL(P, N, seed, false);   // full-res: one GI ray per pixel (lamps: raw_lamps.comp)
+#endif
+#ifdef NRD_SPLIT
+        {   // the signals out; raw_lamps adds the lamps' light into outColor (weight 1 where lamps apply)
+            bool waterPix = texelFetch(gbNormal, pix, 0).a < 0.5;
+            float hit = gGiHitT;
+            imageStore(outColor, pix, vec4(max(indirect, vec3(0.0)), min(hit, 60000.0)));
+            imageStore(sunSig, pix, vec4(shadow, sunT, grassV, sunRay ? 1.0 : 0.0));
+#ifdef LIGHTS_NEE
+            imageStore(lampW, pix, waterPix ? vec4(0.0) : vec4(1.0, 1.0, 1.0, lampFloor));
+#endif
+            return;
+        }
+#endif
+        // Same shading model + contact darkening as the SVGF path (denoise.comp).
+        gSelfBody = selfBodyOf(texelFetch(gbDelta, pix, 0).a);
+        float contact = 0.55 + 0.45 * voxelAO(P, N);
+        bool water = texelFetch(gbNormal, pix, 0).a < 0.5;
+#ifdef FOLIAGE_SSS
+        { float fa = texelFetch(gbNormal, pix, 0).a; gFoliage = isFoliageFlag(fa) ? 1.0 : 0.0; gSss = lookP.x; }
+#endif
+#ifdef WATER_CLEAR
+        // Under water: less sun / sky reaches the bed (its view absorption is in alb).
+        gWaterClarity = waterP.x; gWaterMurk = underP.y; gWave = waveP;
+        { vec4 wv = texelFetch(gbWater, pix, 0); setWaterLightAt(waterLightDepth(wv), P, time, underP.z); }   // + caustics
+#endif
+        setSurface(texelFetch(gbSurf, pix, 0));
+        base = shadeSurface(P, N, rd, alb, water, ndl, shadow, indirect, contact);
+#ifdef LIGHTS_NEE
+        // What shadeSurface multiplies `indirect` by (non-water: gIndW, diffuse + rough specular): the lamps' weight.
+#ifdef WATER_CLEAR
+        lampAlb = gIndW * giScale * contact * gAmbTrans;
+#else
+        lampAlb = gIndW * giScale * contact;
+#endif
+        lampWater = water;
+        lampFloorOut = lampFloor;
+#endif
+#if defined(WATER_CLEAR) || defined(REFL_GLOSSY)
+        base += texelFetch(waterAdd, pix, 0).rgb;
+#endif
+    }
+
+#ifdef FOG_FROXEL
+    vec4 fg = fogSample(froxelVol, posT.w, rd, camPos, pix, res, fogP, fogStart, vec2(hazeK, hazeSea));
+#else
+    vec4 fg = fogUpsample(fogTex, gbPos, pix, posT.w, res);
+#endif
+#if defined(FOG_FROXEL) && defined(WATER_CLEAR)
+    if (!sky) {   // under water the froxels attenuate grey; the albedo already has the per-channel part
+        vec4 wv = texelFetch(gbWater, pix, 0);
+        if (wv.x > 0.0 && wv.y < 0.0) base *= waterFroxelFix(wv.z);
+    }
+#endif
+    // clouds behind the weather fog (it hides them like the land), in front of the surface or of the sky
+    vec4 cl = cloudComposite(cloudHalf, pix, res, camPos, rd, sky ? -1.0 : posT.w);
+    vec3 col = (base * cl.a + cl.rgb) * fg.a + fg.rgb;   // (the sky fades into the fog like the land)
+#ifdef NRD_COMPOSE
+    if (underP.w > 0.5) { vec4 v = texelFetch(nrdValid, pix, 0); col = mix(col, v.rgb, v.a); }
+#endif
+    imageStore(outColor, pix, vec4(col, 1.0));
+#if defined(LIGHTS_NEE) && !defined(NRD_COMPOSE)
+    vec4 lw = vec4(0.0);
+    if (!sky && !lampWater) lw = vec4(lampAlb * fg.a, lampFloorOut);
+    imageStore(lampW, pix, lw);
+#endif
+}

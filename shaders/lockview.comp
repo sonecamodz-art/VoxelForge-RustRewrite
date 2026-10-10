@@ -1,0 +1,87 @@
+// Locked-view debug composite (L key). The window renders the GHOST camera as
+// usual; this pass tints the final image by what the LOCKED camera renders. The
+// renderer is ray traced, so "what a view renders" = the surfaces its primary rays
+// hit: lockPos is a snapshot of the locked view's G-buffer positions, used like a
+// shadow map. For every ghost pixel's surface point P:
+//   outside the locked frustum          -> grey  (never rendered by the locked view)
+//   inside, but behind the locked depth -> blue  (occluded: no primary ray reaches it)
+//   visible                             -> normal colour + LOD distance bands from
+//                                          the locked camera (thin lines):
+//     green  = grass blades start fading (0.7 x r.grass.distance)
+//     yellow = grass blades end (prefiltered ground beyond)
+//     magenta/orange = per-voxel shading detail starts / finishes fading to its mean
+//                      (pixel footprint 0.6 / 1.6 voxels at the locked resolution)
+// mode 1 = highlight, mode 2 = only visible (everything else near-black).
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rgba8, SET(3) binding = 0) uniform image2D outTex;     // final LDR image
+layout(SET(3) binding = 1) uniform sampler2D gbPos;           // ghost view (render res)
+layout(SET(3) binding = 2) uniform sampler2D lockPos;         // locked view snapshot
+layout(std140, SET(3) binding = 14) uniform LockParams {
+    vec3 lkPos;   float lkTanHalfFov;
+    vec3 lkRight; float lkAspect;
+    vec3 lkUp;    float lkGrassDist;
+    vec3 lkFwd;   float lkResY;
+    int lkMode, lkOutW, lkOutH, lkValid;
+};
+
+BEGIN_PASS_UNIFORMS
+PASS_UNIFORMS_BODY
+END_PASS_UNIFORMS
+
+float lvLum(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+// 1 on a thin ring at distance R (width grows with distance so it stays visible).
+float lvBand(float d, float R) {
+    if (R <= 0.0) return 0.0;
+    return 1.0 - smoothstep(0.0, 0.0025 * R + 0.12, abs(d - R));
+}
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    if (pix.x >= lkOutW || pix.y >= lkOutH) return;
+    vec3 col = imageLoad(outTex, pix).rgb;
+    ivec2 gres = textureSize(gbPos, 0);
+    ivec2 gp = min(ivec2((vec2(pix) + 0.5) * vec2(gres) / vec2(lkOutW, lkOutH)), gres - 1);
+    vec4 P = texelFetch(gbPos, gp, 0);
+    float onlyVis = lkMode == 2 ? 1.0 : 0.0;
+    vec3 grey = vec3(lvLum(col));
+    if (P.w < 0.0 || lkValid == 0) {           // sky (or no snapshot): dim
+        imageStore(outTex, pix, vec4(mix(col * 0.55, grey * 0.05, onlyVis), 1.0));
+        return;
+    }
+    vec3 v = P.xyz - lkPos;
+    float z = dot(v, lkFwd);
+    vec2 ndc = vec2(dot(v, lkRight) / (z * lkTanHalfFov * lkAspect), dot(v, lkUp) / (z * lkTanHalfFov));
+    bool inFrustum = z > 0.05 && all(lessThanEqual(abs(ndc), vec2(1.0)));
+    vec3 outc;
+    if (!inFrustum) {
+        outc = mix(mix(grey, col, 0.2) * 0.45, grey * 0.05, onlyVis);
+    } else {
+        ivec2 lres = textureSize(lockPos, 0);
+        ivec2 lp = clamp(ivec2((ndc * 0.5 + 0.5) * vec2(lres)), ivec2(0), lres - 1);
+        // Farthest locked hit in a 3x3 neighbourhood (grass blades cover ground in
+        // single pixels; a point counts as rendered if any nearby ray reaches it).
+        float Lw = -1.0;
+        for (int j = -1; j <= 1; j++)
+            for (int i = -1; i <= 1; i++)
+                Lw = max(Lw, texelFetch(lockPos, clamp(lp + ivec2(i, j), ivec2(0), lres - 1), 0).w);
+        float d = length(v);
+        // Visible if P is not behind the locked view's first hit along that ray
+        // (tolerance: pixel-size mismatch, grazing angles, blade height).
+        bool visible = Lw >= 0.0 && d <= Lw + max(1.0, 0.02 * Lw);
+        if (!visible) {
+            vec3 blue = vec3(0.15, 0.35, 1.0) * (0.35 + 0.65 * lvLum(col));
+            outc = mix(mix(col * 0.5, blue, 0.7), blue * 0.25, onlyVis);
+        } else {
+            outc = col;
+            float kFp = lkResY / (2.0 * lkTanHalfFov);   // distance per unit footprint
+            outc = mix(outc, vec3(0.3, 1.0, 0.3), lvBand(d, 0.7 * lkGrassDist));
+            outc = mix(outc, vec3(1.0, 0.9, 0.1), lvBand(d, lkGrassDist));
+            outc = mix(outc, vec3(1.0, 0.3, 0.9), lvBand(d, 0.6 * kFp));
+            outc = mix(outc, vec3(1.0, 0.55, 0.1), lvBand(d, 1.6 * kFp));
+        }
+    }
+    imageStore(outTex, pix, vec4(outc, 1.0));
+}

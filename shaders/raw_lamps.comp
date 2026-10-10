@@ -1,0 +1,34 @@
+// DLSS-RR COLOR_IN, lamps: next-event estimation of the lamps / glowing bodies (one lamp picked by
+// contribution, one shadow ray), added to raw_shade's colour with the per-pixel weight it left in
+// lampW (albedo x GI scale x contact x fog transmittance; a = the sun + sky floor below which a
+// lamp isn't worth its ray). Its own pass so the lamp ray's traversal code doesn't weigh on the big
+// shading pass (occupancy: ~3 ms there even where no lamp ray was traced).
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rgba16f, SET(3) binding = 0) uniform image2D outColor;            // raw_shade's colour
+layout(rgba16f, SET(3) binding = 1) uniform readonly image2D lampW;      // raw_shade's weights
+layout(SET(3) binding = 3) uniform sampler2D gbNormal;
+layout(SET(3) binding = 4) uniform sampler2D gbPos;
+
+BEGIN_PASS_UNIFORMS
+PASS_UNIFORMS_BODY
+END_PASS_UNIFORMS
+
+void main() {
+#ifdef LIGHTS_NEE
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 res = imageSize(outColor);
+    if (pix.x >= res.x || pix.y >= res.y) return;
+    vec4 w = imageLoad(lampW, pix);
+    if (max(w.r, max(w.g, w.b)) <= 0.0) return;
+    vec4 posT = texelFetch(gbPos, pix, 0);
+    if (posT.w < 0.0) return;
+    vec3 N = texelFetch(gbNormal, pix, 0).xyz * 2.0 - 1.0;
+    uint seed = pixelSeed(pix, frameIdx, 5u);
+    gLightFloor = w.a;
+    vec3 nee = sampleLights(posT.xyz, N, seed);
+    if (max(nee.r, max(nee.g, nee.b)) <= 0.0) return;
+    imageStore(outColor, pix, imageLoad(outColor, pix) + vec4(w.rgb * nee, 0.0));
+#endif
+}

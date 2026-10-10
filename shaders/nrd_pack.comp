@@ -1,0 +1,55 @@
+// NVIDIA NRD (r.denoiser nrd, vk_nrd_path.cpp): raw_shade NRD_SPLIT's signals (+ raw_lamps' lamp light) packed
+// the way NRD reads them (ports of NRD.hlsli's front-end helpers). World units stay voxels (NRD gets voxel
+// matrices and viewZ; its metre-tuned distances are scaled on the host).
+//   IN_DIFF_RADIANCE_HITDIST = REBLUR_FrontEnd_PackRadianceAndNormHitDist(indirect, normalised hit distance)
+//   IN_PENUMBRA     = SIGMA_FrontEnd_PackPenumbra(first blocker distance, tan(sun radius)); lit: NRD_FP16_MAX
+//   IN_TRANSLUCENCY = SIGMA_FrontEnd_PackTranslucency: (lit?, light let through) - 1 for lit pixels, so the
+//                     denoised .yzw is the sun's visibility itself
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(SET(3) binding = 0) uniform sampler2D sigDiff;        // indirect radiance (before albedo), hit distance
+layout(SET(3) binding = 1) uniform sampler2D sigSun;         // visibility, blocker distance, blades, sun ray
+layout(SET(3) binding = 2) uniform sampler2D gbLinearDepth;  // view z (voxels), the RR guide
+layout(SET(3) binding = 3) uniform sampler2D gbNormalRough;  // normal, roughness (the RR guide)
+layout(rgba16f, SET(3) binding = 4) uniform writeonly image2D inDiff;
+layout(r16f, SET(3) binding = 5) uniform writeonly image2D inPenumbra;
+layout(rgba16f, SET(3) binding = 6) uniform writeonly image2D inTransl;
+
+layout(push_constant) uniform NrdPackPC {
+    vec4 hitDist;   // REBLUR hitDistanceParameters A (voxels), B, C; w = sanitize radiance cap
+};
+
+const float NRD_FP16_MAX = 65504.0;
+const float NRD_EPS = 1e-6;
+
+float nrdSpecMagicCurve(float roughness, float power) {   // _NRD_GetSpecMagicCurve
+    float f = 1.0 - exp2(-200.0 * roughness * roughness);
+    return f * pow(clamp(roughness, 0.0, 1.0), power);
+}
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 res = imageSize(inDiff);
+    if (pix.x >= res.x || pix.y >= res.y) return;
+    vec4 d = texelFetch(sigDiff, pix, 0);
+    vec4 s = texelFetch(sigSun, pix, 0);
+    float viewZ = texelFetch(gbLinearDepth, pix, 0).x;
+    float rough = texelFetch(gbNormalRough, pix, 0).w;
+    // REBLUR_FrontEnd_GetNormHitDist (its roughness = the guide's, which REBLUR decodes with)
+    float f = (hitDist.x + abs(viewZ) * hitDist.y) * mix(hitDist.z, 1.0, nrdSpecMagicCurve(rough, 0.5));
+    float nhd = max(clamp(d.w / f, 0.0, 1.0), NRD_EPS);
+    vec3 rad = d.rgb;
+    if (any(isnan(rad)) || any(isinf(rad))) rad = vec3(0.0);
+    rad = clamp(rad, vec3(0.0), vec3(hitDist.w));
+    vec3 ycocg = vec3(dot(rad, vec3(0.25, 0.5, 0.25)), dot(rad, vec3(0.5, 0.0, -0.5)), dot(rad, vec3(-0.25, 0.5, -0.25)));
+    imageStore(inDiff, pix, vec4(ycocg, nhd));
+    // Sun: s.w = a sun ray was traced (else NoL <= 0: penumbra 0, nothing let through)
+    bool ray = s.w > 0.5;
+    bool lit = ray && s.x >= 0.999;
+    float dist = lit ? NRD_FP16_MAX : max(s.y, 0.01);
+    float pen = !ray ? 0.0 : dist >= NRD_FP16_MAX ? NRD_FP16_MAX : min(dist * tan(sunAngle) * 0.5, 32768.0);
+    imageStore(inPenumbra, pix, vec4(pen));
+    float through = ray ? clamp(s.x, 0.0, 1.0) : 0.0;
+    imageStore(inTransl, pix, vec4(lit ? 1.0 : 0.0, through, through, through));
+}

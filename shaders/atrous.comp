@@ -1,0 +1,161 @@
+// SVGF à-trous wavelet iteration on the half-res 1-bounce GI. Run several times
+// with a doubling tap spacing (uStep = 1,2,4,8): each pass is a 5×5 edge-stopping
+// filter whose reach grows geometrically, so a handful of cheap passes cover a
+// huge radius. Edge-stopping weights (normal · plane-distance · LUMINANCE/variance)
+// keep the blur inside surfaces AND inside converged regions: noisy pixels (high
+// variance) blur hard, clean pixels stay crisp. Variance is filtered alongside the
+// colour (with weight², the correct propagation) and drives the next iteration.
+// This is the core of SVGF/ReLAX — the reason 1-spp signals resolve cleanly.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rgba16f, SET(3) binding = 0) uniform writeonly image2D outCV; // rgb = colour, a = variance
+
+layout(SET(3) binding = 2) uniform sampler2D inCV;     // prev iteration (rgb, variance) — iters >= 1
+layout(SET(3) binding = 3) uniform sampler2D gbNormal; // full-res
+layout(SET(3) binding = 4) uniform sampler2D gbPos;    // full-res
+layout(SET(3) binding = 5) uniform sampler2D giMom;    // half-res moments (m1, m2) — iter 0
+layout(SET(3) binding = 6) uniform sampler2D giHist;   // half-res colour + histLen  — iter 0
+layout(SET(3) binding = 7) uniform usampler2D giGuide; // half-res filter guide (see common.glsl)
+
+BEGIN_PASS_UNIFORMS
+PASS_UNIFORMS_BODY
+END_PASS_UNIFORMS
+
+const float kSigmaL = 4.0;   // luminance edge-stop strength (larger = blurs more)
+const float kSigmaN = 64.0;  // normal edge-stop exponent
+const float kSigmaZ = 1.0;   // plane-distance edge-stop scale
+
+
+// Read this iteration's input at a half-res texel: colour + carried variance.
+// Iter 0 pulls colour from the temporal history and variance from the luma moments
+// (temporal variance = m2 - m1²); later iters read the à-trous-carried variance.
+void readInput(ivec2 h, out vec3 col, out float var) {
+    if (uIteration == 0) {
+        col = texelFetch(giHist, h, 0).rgb;
+        vec2 m = texelFetch(giMom, h, 0).xy;
+        var = max(m.y - m.x * m.x, 0.0);
+    } else {
+        vec4 cv = texelFetch(inCV, h, 0);
+        col = cv.rgb;
+        var = cv.a;
+    }
+}
+
+// Variance that drives the luminance edge-stop at the centre pixel. Temporal
+// variance is unreliable with few frames (a single sample has ZERO spread), so
+// freshly-disoccluded pixels fall back to a SPATIAL luminance-variance estimate of
+// the history — this is what makes SVGF blur hard exactly where it's noisiest
+// (camera cuts, revealed geometry) instead of preserving raw 1-spp speckle.
+float centreVariance(ivec2 pix, ivec2 hres) {
+    if (uIteration != 0) return texelFetch(inCV, pix, 0).a;
+    float histLen = texelFetch(giHist, pix, 0).a;
+    if (histLen >= 4.0) {
+        vec2 m = texelFetch(giMom, pix, 0).xy;
+        return max(m.y - m.x * m.x, 0.0);
+    }
+    float s = 0.0, s2 = 0.0, n = 0.0;
+    for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++) {
+            ivec2 q = clamp(pix + ivec2(dx, dy), ivec2(0), hres - 1);
+            float l = luminance(texelFetch(giHist, q, 0).rgb);
+            s += l;
+            s2 += l * l;
+            n += 1.0;
+        }
+    float mean = s / n;
+    return (max(s2 / n - mean * mean, 0.0) + 1e-3) * 2.0; // err toward more blur
+}
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 hres = imageSize(outCV);
+    if (pix.x >= hres.x || pix.y >= hres.y) return;
+
+    ivec2 fc = repTexel(gbPos, pix, textureSize(gbPos, 0));   // same representative as gi.comp
+    vec4 posT = texelFetch(gbPos, fc, 0);
+    if (posT.w < 0.0) { // all-sky texel: nothing to filter
+        imageStore(outCV, pix, vec4(0.0));
+        return;
+    }
+    vec3 P = posT.xyz;
+    vec3 N = texelFetch(gbNormal, fc, 0).xyz * 2.0 - 1.0;
+
+    vec3 cCol;
+    float cVar;
+    readInput(pix, cCol, cVar);
+#ifdef GI_HISTFIX
+    // History fix (NRD ReLAX): a texel revealed this frame (disocclusion while
+    // walking) has 1-3 samples, and a 5x5 filter of equally fresh neighbours turns
+    // that into blotches. Borrow the ACCUMULATED GI of converged texels on the same
+    // surface from a wider, sparse footprint instead, weighted by their history
+    // length; the texel's own samples take over as its history grows.
+    if (uIteration == 0) {
+        float cLen = texelFetch(giHist, pix, 0).a;
+        if (cLen < 4.0) {
+            vec3 acc = cCol * cLen;
+            float ws = cLen;
+            for (int dy = -3; dy <= 3; dy++)
+                for (int dx = -3; dx <= 3; dx++) {
+                    if (dx == 0 && dy == 0) continue;
+                    ivec2 hq = pix + ivec2(dx, dy) * 3;
+                    if (any(lessThan(hq, ivec2(0))) || any(greaterThanEqual(hq, hres))) continue;
+                    Guide gq = unpackGuide(texelFetch(giGuide, hq, 0));
+                    if (gq.sky) continue;
+                    vec4 hv = texelFetch(giHist, hq, 0);
+                    float w = pow(max(dot(N, gq.N), 0.0), 16.0) *
+                              exp(-abs(dot(gq.P - P, N)) / (1.0 + posT.w * 0.01)) * hv.a;
+                    acc += hv.rgb * w;
+                    ws += w;
+                }
+            if (ws > 0.0) cCol = acc / ws;
+        }
+    }
+#endif
+    float cLum = luminance(cCol);
+
+    float vg = centreVariance(pix, hres);
+    // Freshly (dis)occluded texels have ~zero temporal variance: carry the SPATIAL
+    // estimate forward (SVGF §4.2), or iterations 1+ see variance 0 and stop blurring
+    // exactly where the 1-spp noise is worst. Fresh neighbours get the same proxy.
+    bool fresh0 = uIteration == 0 && texelFetch(giHist, pix, 0).a < 4.0;
+    if (fresh0) cVar = vg;
+    float lumPhi = kSigmaL * sqrt(max(vg, 0.0)) + 1e-4;
+
+    // 5×5 à-trous with B3-spline taps, dilated by uStep.
+    const float h5[3] = float[](0.375, 0.25, 0.0625); // |offset| = 0,1,2
+    vec3 cAccum = cCol * (h5[0] * h5[0]);
+    float vAccum = cVar * (h5[0] * h5[0]) * (h5[0] * h5[0]);
+    float wSum = h5[0] * h5[0];
+
+    float depthScale = kSigmaZ * (1.0 + posT.w * 0.01);
+    for (int dy = -2; dy <= 2; dy++)
+        for (int dx = -2; dx <= 2; dx++) {
+            if (dx == 0 && dy == 0) continue;
+            ivec2 hq = pix + ivec2(dx, dy) * uStep;
+            if (hq.x < 0 || hq.y < 0 || hq.x >= hres.x || hq.y >= hres.y) continue;
+            Guide gq = unpackGuide(texelFetch(giGuide, hq, 0));
+            if (gq.sky) continue;
+            vec4 qp = vec4(gq.P, 0.0);
+            vec3 qn = gq.N;
+
+            vec3 qc;
+            float qv;
+            readInput(hq, qc, qv);
+            if (uIteration == 0 && texelFetch(giHist, hq, 0).a < 4.0) qv = max(qv, vg);
+            float qLum = luminance(qc);
+
+            float kern = h5[abs(dx)] * h5[abs(dy)];
+            float wN = pow(max(dot(N, qn), 0.0), kSigmaN);
+            float wZ = exp(-abs(dot(qp.xyz - P, N)) / depthScale);
+            float wL = exp(-abs(cLum - qLum) / lumPhi);
+            float w = kern * wN * wZ * wL;
+
+            cAccum += w * qc;
+            vAccum += w * w * qv; // variance propagates with the square of the weight
+            wSum += w;
+        }
+
+    float inv = 1.0 / max(wSum, 1e-6);
+    imageStore(outCV, pix, vec4(cAccum * inv, vAccum * inv * inv));
+}

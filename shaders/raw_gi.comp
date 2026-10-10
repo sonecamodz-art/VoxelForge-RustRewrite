@@ -1,0 +1,29 @@
+// DLSS-RR input, HALF resolution: one 1-bounce GI sample per 2x2 pixel block, for
+// the block's pixel chosen by a per-frame rotating offset (every pixel is visited
+// every 4 frames). raw_shade.comp reads it with a nearest fetch; DLSS-RR's temporal
+// reconstruction turns the sparse samples into full-res indirect light. Cuts the
+// most expensive per-pixel rays (GI ray + its shadow-at-bounce) by 4x.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rgba16f, SET(3) binding = 0) uniform writeonly image2D rawGi;   // half-res
+layout(SET(3) binding = 3) uniform sampler2D gbNormal;                 // full-res
+layout(SET(3) binding = 4) uniform sampler2D gbPos;                    // full-res
+
+BEGIN_PASS_UNIFORMS
+PASS_UNIFORMS_BODY
+END_PASS_UNIFORMS
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 res = imageSize(rawGi);
+    if (pix.x >= res.x || pix.y >= res.y) return;
+    ivec2 fullRes = textureSize(gbPos, 0);
+    ivec2 off = ivec2(frameIdx & 1u, (frameIdx >> 1u) & 1u);
+    ivec2 fpix = min(pix * 2 + off, fullRes - 1);
+    vec4 posT = texelFetch(gbPos, fpix, 0);
+    if (posT.w < 0.0) { imageStore(rawGi, pix, vec4(0.0)); return; }
+    vec3 N = texelFetch(gbNormal, fpix, 0).xyz * 2.0 - 1.0;
+    uint seed = pixelSeed(fpix, frameIdx, 0x5bd1e995u);
+    imageStore(rawGi, pix, vec4(giBounce(posT.xyz, N, seed), 1.0));
+}

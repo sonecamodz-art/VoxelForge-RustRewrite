@@ -1,0 +1,185 @@
+// Pass 2.25: HALF-resolution 1-bounce global illumination. The indirect term is
+// low-frequency (soft colored fill), so tracing it at quarter the pixel count and
+// bilaterally upsampling in the denoise pass is visually free but reclaims the bulk
+// of the lighting budget — the incoherent hemisphere ray + its shadow-at-bounce ray
+// are the two most expensive traces per pixel. Full-res, high-frequency terms (the
+// sun shadow) stay in lighting.comp. Output is a half-res history (indirect.rgb,
+// count) temporally accumulated with reprojection, exactly like the shadow history.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rgba16f, SET(3) binding = 0) uniform writeonly image2D giHistCur; // indirect rgb, count
+layout(rgba32f, SET(3) binding = 1) uniform writeonly image2D giMomCur;  // luma m1, m2, fast luma
+
+layout(SET(3) binding = 3) uniform sampler2D gbNormal;     // full-res
+layout(SET(3) binding = 4) uniform sampler2D gbPos;        // full-res
+layout(SET(3) binding = 5) uniform sampler2D gbPosPrev;    // full-res (reproject validation)
+layout(SET(3) binding = 7) uniform sampler2D gbNormalPrev; // full-res (reproject validation)
+layout(SET(3) binding = 10) uniform sampler2D giHistPrev;  // half-res previous indirect
+layout(SET(3) binding = 11) uniform sampler2D giMomPrev;   // half-res previous luma moments
+layout(SET(3) binding = 12) uniform sampler2D gbMotion;    // full-res prevUV - curUV
+layout(rgba32ui, SET(3) binding = 14) uniform writeonly uimage2D giGuide;  // half-res filter guide
+layout(SET(3) binding = 13) uniform sampler2D gbDelta;     // full-res P - Pprev
+
+BEGIN_PASS_UNIFORMS
+PASS_UNIFORMS_BODY
+END_PASS_UNIFORMS
+
+const float kMaxHistory = 48.0;  // frames of accumulation (longer = smoother)
+const float kFastAlpha = 0.25;   // fast history ~ last 4 frames (anti-lag reference)
+const float kAntiLagK = 3.0;     // clamp band, in std-devs of the fast history
+const float kFastSigmaScale = 0.378;   // std of a 4-frame EMA / per-sample std
+const float kFireflySigma = 4.0; // a new sample may exceed the mean by this many std-devs
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 res = imageSize(giHistCur);    // half-res
+    if (pix.x >= res.x || pix.y >= res.y) return;
+    ivec2 fullRes = textureSize(gbPos, 0);
+
+    // Each half-res pixel samples one of its 4 covered full-res texels, rotating
+    // per frame: over 4 frames every full-res texel is visited, so temporal
+    // accumulation recovers near-full-res GI detail from the quarter-res traces.
+    ivec2 off = ivec2(frameIdx & 1u, (frameIdx >> 1u) & 1u);
+    ivec2 fpix = min(pix * 2 + off, fullRes - 1);
+
+    // Filter guide for this half-res texel = its REPRESENTATIVE full-res texel: the
+    // first non-sky one of its 2x2 block (exact bits). It used to be pix*2 always, so
+    // a silhouette texel whose corner is sky was "sky" to the filter and the upsample
+    // while its samples came from geometry (and a sky corner zeroed its history).
+    ivec2 gq = repTexel(gbPos, pix, fullRes);
+    vec4 gp = texelFetch(gbPos, gq, 0);
+    {
+        uint gn = gp.w < 0.0 ? 0u : packUnorm4x8(texelFetch(gbNormal, gq, 0));
+        imageStore(giGuide, pix, uvec4(floatBitsToUint(gp.xyz), gn));
+    }
+    if (gp.w < 0.0) {   // all four texels are sky — no indirect
+        imageStore(giHistCur, pix, vec4(0.0));
+        imageStore(giMomCur, pix, vec4(0.0));
+        return;
+    }
+
+    // This frame's rotating sample; if that texel is sky, sample the representative
+    // (history keeps accumulating instead of being reset every 4th frame).
+    vec4 posT = texelFetch(gbPos, fpix, 0);
+    if (posT.w < 0.0) { fpix = gq; posT = gp; }
+
+    vec3 P = posT.xyz;
+    vec3 N = texelFetch(gbNormal, fpix, 0).xyz * 2.0 - 1.0;
+    // Own salt: lighting.comp seeds the SAME full-res pixel with salt 0, which made
+    // this pixel's GI direction and its sun-cone jitter use identical random numbers.
+    uint seed = pixelSeed(fpix, frameIdx, 0x68e31da4u);
+
+    // GI: a cosine-hemisphere ray returns the RADIANCE arriving from that direction (giPath).
+    // Bodies block / bounce it too with r.gi.objects; otherwise world-only.
+#ifdef GI_LDS
+    // Each full-res texel is sampled every 4th frame (rotating sub-texel above), so
+    // its own sequence index advances once per visit.
+    vec3 giDir = cosineHemisphereU(N, ldSample2(fpix, frameIdx >> 2u, 0x68e31da4u));
+#else
+    vec3 giDir = cosineHemisphere(N, seed);
+#endif
+    // The path (common.glsl giPath): sky if the ray really escapes, else the hit's emission + direct sun
+    // (+ bounce 2 with r.gi.bounces 2); no fade, no reach limit.
+    vec3 indirect = giPath(P, N, giDir, seed);
+#ifdef LIGHTS_NEE
+    gLightFloor = lightFloorAt(P, N, 0.0);   // (sky only: this pass doesn't know the sun's shadow)
+    vec3 nee = sampleLights(P, N, seed);   // lamps / glowing bodies, sampled directly
+#else
+    const vec3 nee = vec3(0.0);
+#endif
+    indirect += nee;
+#ifdef AO_IN_GI
+    // Contact darkening only ever scales the INDIRECT term, so apply it here at the
+    // (rotating, temporally supersampled) half-res sample instead of per full-res
+    // pixel in denoise.comp — a quarter of the voxel lookups for the same result.
+    indirect *= 0.55 + 0.45 * voxelAO(P, N);
+#endif
+
+    // Reproject through the motion vector and fetch the HALF-res history bilinearly,
+    // validating each tap against the previous FULL-res G-buffer (the texel that
+    // represents it) — same scheme as lighting.comp. Luminance moments (m1, m2)
+    // accumulate alongside so the denoiser can recover variance = m2 - m1².
+    float lum = luminance(indirect);
+    float count = 0.0;
+    vec3 giAcc = indirect;
+    vec2 mom = vec2(lum, lum * lum);
+    // From this HALF-res texel's centre + the sampled point's motion: a still camera
+    // maps exactly onto the same texel (no per-frame bilinear re-filtering / blur
+    // from the rotating sub-texel offset or the jitter); real motion interpolates.
+    vec2 puv = (vec2(pix) + 0.5) / vec2(res) + texelFetch(gbMotion, fpix, 0).xy;
+    vec3 Pprev = P - texelFetch(gbDelta, fpix, 0).xyz;
+    vec2 fp = puv * vec2(res) - 0.5;
+    ivec2 b = ivec2(floor(fp));
+    vec2 fr = fp - vec2(b);
+    vec4 hSum = vec4(0.0);
+    vec3 mSum = vec3(0.0);
+    float wSum = 0.0;
+    float tol = 0.5 + posT.w * 0.004;
+    for (int k = 0; k < 4; k++) {
+        ivec2 q = b + ivec2(k & 1, k >> 1);
+        if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, res))) continue;
+        ivec2 fq = repTexel(gbPosPrev, q, fullRes);   // same representative rule, last frame
+        vec4 prevP = texelFetch(gbPosPrev, fq, 0);
+        prevP.xyz += shiftP.xyz;   // (a floating-origin rebase since)
+        if (prevP.w <= 0.0) continue;
+        vec3 prevN = texelFetch(gbNormalPrev, fq, 0).xyz * 2.0 - 1.0;
+        if (abs(dot(prevP.xyz - Pprev, N)) >= tol || dot(prevN, N) <= 0.85) continue;
+        float w = ((k & 1) != 0 ? fr.x : 1.0 - fr.x) * ((k >> 1) != 0 ? fr.y : 1.0 - fr.y);
+        hSum += texelFetch(giHistPrev, q, 0) * w;
+        mSum += texelFetch(giMomPrev, q, 0).xyz * w;
+        wSum += w;
+    }
+    float fast = lum;
+#ifdef GI_BICUBIC
+    // Moving camera: a bilinear history fetch re-filters the history every frame, and
+    // over a 48-frame history that compounds into a heavy blur (washed-out per-voxel
+    // bounce light while walking). When all 4 bilinear taps are valid (same surface),
+    // resample with Catmull-Rom instead (sharp, 16 taps), clamped to the 4 central
+    // texels' range so the negative lobes can't ring across an edge the outer taps
+    // straddle. Still camera: fr == 0 and both give the same texel.
+    if (wSum > 0.999 && any(greaterThan(abs(fr - 0.0), vec2(1e-4)))) {
+        vec2 w0 = fr * (-0.5 + fr * (1.0 - 0.5 * fr));
+        vec2 w1 = 1.0 + fr * fr * (-2.5 + 1.5 * fr);
+        vec2 w2 = fr * (0.5 + fr * (2.0 - 1.5 * fr));
+        vec2 w3 = fr * fr * (-0.5 + 0.5 * fr);
+        vec4 cr = vec4(0.0);
+        vec4 lo = vec4(1e30), hi = vec4(-1e30);
+        for (int j = 0; j < 4; j++)
+            for (int i = 0; i < 4; i++) {
+                ivec2 q = clamp(b + ivec2(i - 1, j - 1), ivec2(0), res - 1);
+                vec4 hv = texelFetch(giHistPrev, q, 0);
+                float wx = i == 0 ? w0.x : i == 1 ? w1.x : i == 2 ? w2.x : w3.x;
+                float wy = j == 0 ? w0.y : j == 1 ? w1.y : j == 2 ? w2.y : w3.y;
+                cr += hv * (wx * wy);
+                if ((i == 1 || i == 2) && (j == 1 || j == 2)) { lo = min(lo, hv); hi = max(hi, hv); }
+            }
+        hSum = vec4(clamp(cr.rgb, lo.rgb, hi.rgb), hSum.a / wSum) * wSum;
+    }
+#endif
+    if (wSum > 1e-3) {
+        vec4 hp = hSum / wSum;
+        vec3 mp = mSum / wSum;
+        count = min(hp.a, kMaxHistory);
+        float sigma = sqrt(max(mp.y - mp.x * mp.x, 0.0));
+        // Firefly suppression (ReLAX-style): once the pixel has some history, a single
+        // sample can't jump more than a few std-devs above its mean (one ray on a tiny
+        // emissive otherwise pulses for dozens of frames).
+        if (count >= 4.0) {
+            float cap = mp.x + kFireflySigma * sigma + 0.05;
+            if (lum > cap) { indirect *= cap / lum; lum = cap; }
+        }
+        float w = 1.0 / (count + 1.0);
+        fast = mix(mp.z, lum, max(w, kFastAlpha));
+        // Anti-lag: clamp the long history's luma to the fast history +- its noise
+        // (GI lagged ~48 frames behind edits / a moving sun on static surfaces).
+        vec3 slow = hp.rgb;
+        float sl = luminance(slow), band = kAntiLagK * sigma * kFastSigmaScale + 0.02;
+        float cl = clamp(sl, fast - band, fast + band);
+        if (sl > 1e-4) slow *= cl / sl;
+        giAcc = mix(slow, indirect, w);
+        mom = mix(mp.xy, vec2(lum, lum * lum), w);
+    }
+    imageStore(giHistCur, pix, vec4(giAcc, count + 1.0));
+    imageStore(giMomCur, pix, vec4(mom, fast, 0.0));
+}

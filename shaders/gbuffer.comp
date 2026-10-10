@@ -1,0 +1,564 @@
+// Pass 1: primary rays → G-buffer (albedo+emissive, normal, world pos + t).
+// Sky pixels get t = -1. All lighting happens in the next pass.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rgba8, SET(3) binding = 0) uniform writeonly image2D gbAlbedo;   // rgb + emissive/8
+layout(rgba8, SET(3) binding = 1) uniform writeonly image2D gbNormal;   // n*0.5+0.5
+layout(rgba32f, SET(3) binding = 2) uniform writeonly image2D gbPos;    // world pos + t
+// Screen-space motion vector = prevUV - curUV (where this surface point was last
+// frame; moving bodies use their previous pose). Consumed by DLSS and the
+// temporal passes.
+layout(rg16f, SET(3) binding = 3) uniform writeonly image2D gbMotion;
+// World-space displacement since last frame of the surface point (P - Pprev):
+// zero for the static world, the body's motion for objects. Lets the temporal
+// passes validate history on MOVING bodies instead of rejecting it every frame.
+layout(rgba16f, SET(3) binding = 9) uniform writeonly image2D gbDelta;
+// Transparent water (r.water 1): (in-water view path length, bed depth below the
+// surface, wave normal .x, .z); 0 = not seen through water. Read by water_refl.comp
+// (reflection + glint + in-scatter) and the shading passes (light under water).
+layout(rgba16f, SET(3) binding = 14) uniform writeonly image2D gbWater;
+// The surface (material Surf): roughness, metalness, detail bump x / y (0.5 = none). Read by the shading passes
+// (common.glsl setSurface).
+layout(rgba8, SET(3) binding = 16) uniform writeonly image2D gbSurf;
+#ifdef DLSS_GUIDES
+// Extra DLSS Ray Reconstruction guide buffers (VK-only). Linear camera-space depth; normal(-1..1) packed with
+// roughness in .w; the specular albedo (the environment BRDF: what shadeSurface multiplies reflected light by)
+// and the diffuse albedo (base x (1 - metalness) x (1 - that)) - the same split the shading uses.
+layout(r32f,    SET(3) binding = 4) uniform writeonly image2D gbLinearDepth;
+layout(rgba16f, SET(3) binding = 5) uniform writeonly image2D gbNormalRough;
+layout(rgba8,   SET(3) binding = 6) uniform writeonly image2D gbSpecAlbedo;
+layout(rgba8,   SET(3) binding = 17) uniform writeonly image2D gbDiffAlbedo;
+// Device-style depth for DLSS Super Resolution / DLAA: reverse-Z infinite
+// projection, d = near / viewZ (1 at the near plane, -> 0 at infinity; sky = 0).
+layout(r32f,    SET(3) binding = 8) uniform writeonly image2D gbDepthHW;
+const float kDepthNear = 0.05;
+#define STORE_GUIDES_DEPTH(T) \
+    imageStore(gbLinearDepth, pix, vec4((T) * dot(rd, camFwd), 0, 0, 0)); \
+    imageStore(gbDepthHW, pix, vec4(kDepthNear / max((T) * dot(rd, camFwd), kDepthNear), 0, 0, 0))
+#define STORE_GUIDES_SKY \
+    imageStore(gbLinearDepth, pix, vec4(1.0e5, 0, 0, 0)); \
+    imageStore(gbNormalRough, pix, vec4(0, 0, 0, 1.0)); \
+    imageStore(gbSpecAlbedo, pix, vec4(0.0)); \
+    imageStore(gbDiffAlbedo, pix, vec4(0.0)); \
+    imageStore(gbDepthHW, pix, vec4(0.0)); \
+    imageStore(gbSurf, pix, vec4(1.0, 0.0, 0.5, 0.5))
+#else
+#define STORE_GUIDES_DEPTH(T)
+#define STORE_GUIDES_SKY imageStore(gbSurf, pix, vec4(1.0, 0.0, 0.5, 0.5))
+#endif
+// A surface hit: its roughness / metalness (+ the RR guides from them and the base colour ALB, normal N, distance T).
+vec2 gFacet = vec2(0.0);   // this hit's per-voxel facet tilt (main: common.glsl facetNormal), 0 = flat
+void storeSurface(ivec2 pix, vec3 rd, vec3 alb, vec3 N, float T, float rough, float metal) {
+    imageStore(gbSurf, pix, vec4(rough, metal, gFacet * 0.5 + 0.5));
+#ifdef DLSS_GUIDES
+    N = facetTilt(N, gFacet);   // (RR sees the normal that is shaded)
+    vec3 spec = envBRDF(surfaceF0(alb, metal), max(dot(N, -rd), 1e-3), rough);
+    imageStore(gbNormalRough, pix, vec4(N, rough));
+    imageStore(gbSpecAlbedo, pix, vec4(spec, 1.0));
+    imageStore(gbDiffAlbedo, pix, vec4(alb * (1.0 - metal) * (1.0 - spec), 1.0));
+#endif
+}
+#define STORE_GUIDES_HIT(N, T, ALB, ROUGH, METAL) \
+    STORE_GUIDES_DEPTH(T); storeSurface(pix, rd, ALB, N, T, ROUGH, METAL)
+
+BEGIN_PASS_UNIFORMS
+PASS_UNIFORMS_BODY
+END_PASS_UNIFORMS
+
+// Locked view (L), mode 1: surfaces come from the locked camera's snapshot,
+// splatted into this (ghost) view by lock_splat.comp.
+layout(r32ui, SET(3) binding = 10) uniform readonly uimage2D lockIdx;
+layout(SET(3) binding = 11) uniform sampler2D lockPos;
+layout(SET(3) binding = 12) uniform sampler2D lockNormal;
+layout(SET(3) binding = 13) uniform sampler2D lockAlbedo;
+
+#ifdef DEBUG_HEAT
+// .x = primary-ray DDA steps (incl. grass shell); lighting.comp adds .y (shadow).
+layout(rgba16f, SET(3) binding = 7) uniform writeonly image2D dbgHeat;
+#endif
+
+// Where this surface point was LAST frame, in world space. For the static world
+// that's the same point; for a moving/rotating body it's the same local voxel
+// carried by the body's previous pose (prevObjToWorld * worldToObj * P) — this is
+// what makes motion vectors correct for moving objects (no ghost trails).
+vec3 prevWorldPos(vec3 P, int obj) {
+    if (obj < 0) return P;
+    vec3 local = (objs[obj].worldToObj * vec4(P, 1.0)).xyz;
+    return (objs[obj].prevObjToWorld * vec4(local, 1.0)).xyz;
+}
+// Reproject a (previous-frame) world point into the previous frame's screen (same
+// math as the temporal passes' reprojection); return prevUV - curUV.
+vec2 reprojMotion(vec3 Pprev, vec2 curSample, ivec2 res) {
+    float aspect = float(res.x) / float(res.y);
+    vec3 dp = Pprev - prevCamPos;
+    float pz = dot(dp, prevCamFwd);
+    if (pz <= 0.0) return vec2(0.0);
+    vec2 puv = vec2(dot(dp, prevCamRight) / (pz * prevTanHalfFov * aspect),
+                    dot(dp, prevCamUp) / (pz * prevTanHalfFov)) * 0.5 + 0.5;
+    return puv - curSample / vec2(res);
+}
+#define STORE_MOTION(P, OBJ) \
+    { vec3 pPrev_ = prevWorldPos(P, OBJ); \
+      imageStore(gbMotion, pix, vec4(reprojMotion(pPrev_, sampleC, res), 0.0, 0.0)); \
+      imageStore(gbDelta, pix, vec4((P) - pPrev_, float((OBJ) + 1))); }   /* .a = body + 1 (0 = world) */
+
+// Animated water surface normal: a few directional gradient waves (gerstner-ish) of
+// the world XZ + time. The lighting/shade passes turn this into moving specular +
+// sky reflection, so still water stops looking like flat blue plastic. VK-only.
+// `fp` = pixel footprint (voxels per pixel): each octave fades out before it would
+// alias (wavelength 2π/freq < ~2 pixels) — distant water stops sparkling.
+vec3 waterNormal(vec2 p, float t, float fp) {
+#ifdef WATER_CLEAR
+    gWave = waveP;
+    return lakeNormal(p, t, fp);   // common.glsl: the lake waves (caustics use the same ones)
+#endif
+    const vec2 dir[3] = vec2[](vec2(0.80, 0.60), vec2(-0.62, 0.78), vec2(0.30, -0.95));
+    const float freq[3] = float[](0.28, 0.45, 0.72);
+    const float amp[3]  = float[](0.16, 0.10, 0.05);
+    const float spd[3]  = float[](1.1, 1.6, 2.3);
+    vec2 grad = vec2(0.0);
+    for (int i = 0; i < 3; i++) {
+        float lod = 1.0 - smoothstep(0.5, 1.0, fp * freq[i] / 3.14159265);
+        grad += dir[i] * (lod * amp[i] * freq[i] * cos(dot(dir[i], p) * freq[i] + t * spd[i]));
+    }
+    return normalize(vec3(-grad.x, 1.0, -grad.y));
+}
+
+float hash21(vec2 p) {
+    p = fract(p * vec2(123.34, 456.21));
+    p += dot(p, p + 45.32);
+    return fract(p.x * p.y);
+}
+
+#ifdef DEBUG_HEAT
+#define STORE_HEAT imageStore(dbgHeat, pix, vec4(float(gSteps), 0.0, 0.0, 0.0))
+#else
+#define STORE_HEAT
+#endif
+#ifdef GRASS_ON
+// GRASS BLADE LAYER (shaders/grass.glsl): traced along a ray from `o` (the eye, or where a view
+// ray left the water from below: tBase further on) up to tEnd, independent of which face the
+// terrain ray hit, so blades stand over step edges and against the sky. Near the draw distance
+// blades fade out stochastically (resolved by the temporal AA) into the prefiltered ground below.
+// A blade hit writes the pixel (seen through water: x wMul, gbWater = wOut) and returns true.
+bool storeBlades(ivec2 pix, ivec2 res, vec2 sampleC, vec3 rd, vec3 o, vec3 d, float tEnd, float tBase,
+                 vec3 wMul, vec4 wOut) {
+    GHit gh;
+    gWindEye = camPos.xz;
+    float hv = hash21(vec2(pix) + float(frameIdx % 64u) * 7.31);   // one dither value: blades | tufts
+    float tB = min(tEnd, grassDist - tBase);
+    float gt = -1.0;
+    if (tB > 0.0) {
+        gt = traceGrass(o, d, tB, time, prevTime, gh, false);
+        if (gt >= 0.0 && hv < smoothstep(0.7 * grassDist, grassDist, tBase + gt)) gt = -1.0;   // faded out
+    }
+    // Far grass LOD (r.grass.far): tufts take over where the blades fade, and fade out themselves
+    // at the end of their range (grass.glsl traceTufts).
+    float farD = grassDist * optP.y;
+    if (gt < 0.0 && farD > grassDist) {
+        float t0 = max(0.7 * grassDist - tBase, 0.0), t1 = min(tEnd, farD - tBase);
+        // Only where the ray is within grass height of the ground it ends on (a steep view from
+        // high up walks no empty tiles); rays well up into the sky find none.
+        if (tEnd < 1e29) t0 = max(t0, tEnd - (kGMaxH + 1.0) / max(-d.y, 1e-3));
+        else if (d.y > 0.05) t1 = t0;
+        float tt = t1 > t0 ? traceTufts(o, d, t0, t1, gh) : -1.0;
+        if (tt >= 0.0) {
+            float D = tBase + tt;
+            if (hv < smoothstep(0.7 * grassDist, grassDist, D) && hv >= smoothstep(0.75 * farD, farD, D)) gt = tt;
+        }
+    }
+    if (gt < 0.0) return false;
+    vec3 Pg = o + d * gt, gN = gh.n, gPrev = gh.pPrev;
+    float tt = tBase + gt;
+    if (rainA.z > 0.01) {   // wet blades: darker, a little greyer (the rain's soft light; Hugo: grass too vibrant in rain)
+        float wet = rainA.z * skyOpen(Pg + vec3(0.0, 2.0, 0.0));
+        gh.alb = mix(gh.alb, vec3(dot(gh.alb, vec3(0.2126, 0.7152, 0.0722))), 0.25 * wet) * mix(1.0, 0.72, wet);
+    }
+    imageStore(gbAlbedo, pix, vec4(gh.alb * wMul, 0.0));
+    imageStore(gbNormal, pix, vec4(gN * 0.5 + 0.5, 0.7));   // blades are foliage (0.7 = blade)
+    imageStore(gbPos, pix, vec4(Pg, tt));
+    imageStore(gbMotion, pix, vec4(reprojMotion(gPrev, sampleC, res), 0.0, 0.0));
+    imageStore(gbDelta, pix, vec4(Pg - gPrev, 0.0));
+    imageStore(gbWater, pix, wOut);
+    STORE_GUIDES_HIT(gN, tt, gh.alb * wMul, 0.85, 0.0);
+    STORE_HEAT;
+    return true;
+}
+#endif
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 res = imageSize(gbAlbedo);
+    if (pix.x >= res.x || pix.y >= res.y) return;
+
+    // Sample position = pixel centre + this frame's sub-pixel jitter (0 unless an
+    // AA/upscale resolve or the ground-truth accumulator asks for it). The motion
+    // vector is computed from this SAME position, so it is the true motion of the
+    // surface point with no jitter component (what DLSS/TAA expect).
+    vec2 sampleC = vec2(pix) + 0.5 + jitter;
+    vec2 ndc = sampleC / vec2(res) * 2.0 - 1.0;
+    float aspect = float(res.x) / float(res.y);
+    vec3 rd = normalize(camFwd + camRight * (ndc.x * aspect * tanHalfFov) +
+                        camUp * (ndc.y * tanHalfFov));
+    imageStore(gbWater, pix, vec4(0.0));
+
+    if (lockActive > 0.5) {
+        // Only what the locked camera renders exists; everything else is sky.
+        uint li = imageLoad(lockIdx, pix).r;
+        if (li == 0xFFFFFFFFu) {
+            imageStore(gbAlbedo, pix, vec4(0));
+            imageStore(gbNormal, pix, vec4(0));
+            imageStore(gbPos, pix, vec4(0, 0, 0, -1.0));
+            imageStore(gbMotion, pix, vec4(0.0));
+            imageStore(gbDelta, pix, vec4(0.0));
+            STORE_GUIDES_SKY;
+            return;
+        }
+        ivec2 lres = textureSize(lockPos, 0);
+        ivec2 lp = ivec2(int(li % uint(lres.x)), int(li / uint(lres.x)));
+        vec3 P = texelFetch(lockPos, lp, 0).xyz;
+        vec4 nrm = texelFetch(lockNormal, lp, 0);
+        float t = length(P - camPos);
+        imageStore(gbAlbedo, pix, texelFetch(lockAlbedo, lp, 0));
+        imageStore(gbNormal, pix, nrm);
+        imageStore(gbPos, pix, vec4(P, t));
+        STORE_MOTION(P, -1);
+        STORE_GUIDES_HIT(nrm.xyz * 2.0 - 1.0, t, texelFetch(lockAlbedo, lp, 0).rgb, 0.9, 0.0);
+        return;
+    }
+
+    // Camera inside solid terrain (flying through a hill): the ray starts where it leaves
+    // that solid, so the caves / surfaces around are seen from within instead of the
+    // block's flat colour. The camera cell is the same for every pixel (uniform branch).
+    uint camMat = voxelMatAt(camPos);
+    float tSkip = 0.0;
+    bool voidRay = false;   // inside terrain, this ray only leaves it out of the world: sky
+    if (camMat != 0u && camMat != 5u) {
+        tSkip = exitSolid(camPos, rd, 2048);
+        voidRay = tSkip < 0.0;
+        tSkip = max(tSkip, 0.0);
+    }
+    vec3 ro = camPos + rd * tSkip;
+#ifdef WATER_CLEAR
+    gWaterClarity = waterP.x; gWaterMurk = underP.y; gWave = waveP;
+    // The primary ray stops AT water (its surface is what we look through). A camera under
+    // water sees through the water up to where the ray leaves it through the surface (tExit),
+    // the rest is decided there (refraction / total internal reflection, below).
+    bool camWet = camMat == 5u;
+    Hit h;
+    float tExit = -1.0;
+    if (camWet) {
+        h = traceScenePrimary(ro, rd, 1e30, 5u);
+        if (rd.y > 0.02) {   // the surface above the eye (flat there; its waves are normals)
+            float surfY = underP.x > 0.0 ? camPos.y + underP.x : floor(camPos.y + waterAbove(camPos, 96));
+            float te = (surfY - camPos.y) / rd.y;
+            vec3 Pe = camPos + rd * te;
+            if ((!h.hit || h.t > te) && voxelMatAt(Pe - vec3(0.0, 0.5, 0.0)) == 5u && voxelMatAt(Pe + vec3(0.0, 0.5, 0.0)) != 5u)
+                tExit = te;
+        }
+    } else {
+        h = traceScenePrimary(ro, rd, 1e30, 0u);
+    }
+#else
+    bool camWet = false;
+    Hit h = traceScenePrimary(ro, rd, 1e30, kSkipMat);
+#endif
+    h.t += tSkip;
+    if (voidRay) h.hit = false;
+    // Endless: a chunk that streamed in past the trusted radius fades in over the horizon it
+    // replaces - until its fade is through a share of its pixels (dithered, blended by the
+    // temporal accumulation) still show the heightfield (traceHorizon below).
+    if (h.hit && h.obj < 0 && horB.z != 0 && !camWet) {
+        vec3 Ph = camPos + rd * h.t;
+        float f = chunkFadeAt(Ph.xz);
+        if (f < 1.0 && length(Ph.xz - camPos.xz) > float(horB.w)) {
+            float n = fract(52.9829189 * fract(dot(vec2(pix) + 5.588238 * float(frameIdx & 63u), vec2(0.06711056, 0.00583715))));
+            if (n >= f) h.hit = false;
+        }
+    }
+#ifdef GRASS_ON
+    // Blades straight from the eye (none from under water: blades grow in air, above the surface).
+    if (!camWet && storeBlades(pix, res, sampleC, rd, camPos, rd, h.hit ? h.t : 1e30, 0.0, vec3(1.0), vec4(0.0)))
+        return;
+#endif
+#ifdef WATER_CLEAR
+    // From under water, the ray reaches the surface: seen from below it refracts out (1.33 -> 1)
+    // inside Snell's window (a ~97 degree cone: the whole sky squeezed into a bright circle,
+    // wobbling with the waves) and is a perfect mirror of the water below outside it (total
+    // internal reflection). What it then hits becomes this pixel's surface, like the bed seen
+    // from above; gbWater = (in-water path, -1 - depth of the point, water path along the
+    // straight view ray = what the froxels cover, -).
+    int exitMode = 0;               // 1 = out through the window, 2 = reflected back down
+    vec3 exitP = vec3(0.0), exitMul = vec3(1.0);
+    vec4 exitW = vec4(0.0);
+    if (tExit >= 0.0) {
+        vec3 Pe = camPos + rd * tExit;
+        float fpS = tExit * 2.0 * tanHalfFov / float(res.y);
+        vec3 Nd = -waterNormal(Pe.xz, time, fpS);   // facing into the water
+        Nd = normalize(mix(vec3(0.0, -1.0, 0.0), Nd, waterP.y));
+        vec3 rdT = refract(rd, Nd, 1.33);
+        if (dot(rdT, rdT) < 0.5) {
+            vec3 rdR = reflect(rd, Nd);
+            Hit b = traceScenePrimary(Pe + rdR * 0.02, rdR, 256.0, 5u);
+            float lenR = b.hit ? b.t : 256.0, tot = tExit + lenR;
+            vec3 Pb = Pe + rdR * lenR;
+            exitW = vec4(tot, -1.0 - (b.hit ? waterAbove(Pb + b.normal * 0.5, 96) : 0.0), tExit, 0.0);
+            exitMul = waterTrans(tot);
+            h = b;
+            h.t = tot;
+            exitP = Pb;
+            exitMode = 2;
+        } else {
+            float cosT = max(dot(rdT, -Nd), 0.0);
+            float F = 0.02 + 0.98 * pow(1.0 - cosT, 5.0);   // Schlick on the air side
+            Hit a = traceScenePrimary(Pe + rdT * 0.02, rdT, 1e30, 5u);
+            exitW = vec4(tExit, -1.0, tExit, 0.0);
+            exitMul = waterTrans(tExit) * (1.0 - F);
+#ifdef GRASS_ON
+            if (storeBlades(pix, res, sampleC, rd, Pe, rdT, a.hit ? a.t : 1e30, tExit, exitMul, exitW)) return;
+#endif
+            if (!a.hit) {   // the sky through the window: the composite shades it in the refracted direction
+                imageStore(gbWater, pix, exitW);
+                imageStore(gbAlbedo, pix, vec4(0));
+                imageStore(gbNormal, pix, vec4(rdT * 0.5 + 0.5, 0.0));
+                imageStore(gbPos, pix, vec4(0, 0, 0, -1.0));
+                imageStore(gbMotion, pix, vec4(0.0));
+                imageStore(gbDelta, pix, vec4(0.0));
+                STORE_GUIDES_SKY;
+                STORE_HEAT;
+                return;
+            }
+            exitP = Pe + rdT * a.t;
+            h = a;
+            h.t = tExit + a.t;
+            exitMode = 1;
+        }
+        if (!h.hit) {   // reflected into open water: nothing but murk (water_refl.comp)
+            imageStore(gbWater, pix, exitW);
+            imageStore(gbAlbedo, pix, vec4(0));
+            imageStore(gbNormal, pix, vec4(0.0, 1.0, 0.0, 1.0) * 0.5 + 0.5);
+            imageStore(gbPos, pix, vec4(exitP, h.t));
+            STORE_MOTION(Pe, -1);
+            STORE_GUIDES_HIT(vec3(0.0, 1.0, 0.0), h.t, vec3(0.0), 0.9, 0.0);
+            STORE_HEAT;
+            return;
+        }
+    }
+#endif
+    if (!h.hit && !camWet && lockActive < 0.5) {
+        // Endless worlds: past the loaded chunks the land goes on as the far horizon.
+        HorHit hz = traceHorizon(camPos, rd);
+#ifdef WATER_CLEAR
+        if (hz.hit && hz.water) {
+            // Water beyond the loaded chunks: shaded like the water nearby (below) - its waves, Fresnel sky reflection
+            // and the body's scatter (water_refl.comp), the bed seen through the shallows: the heightfield keeps the
+            // bed's depth and material, the refracted path to it is depth / its slope. gbPos stays on the surface (the
+            // bed lit as the surface is: its sun visibility, attenuated by the depth in gbWater.y; a bed point under
+            // the heightfield's water would shadow itself in horizonSunVisibility).
+            vec3 P = camPos + rd * hz.t;
+            float fpS = hz.t * 2.0 * tanHalfFov / float(res.y);
+            vec3 Nw = waterNormal(P.xz, time, fpS);
+            float F = waterFresnel(Nw, -rd);
+            vec3 rdR = refract(rd, normalize(mix(vec3(0.0, 1.0, 0.0), Nw, waterP.y)), 1.0 / 1.33);
+            if (dot(rdR, rdR) < 0.5) rdR = rd;
+            float len = min(hz.depth / max(-rdR.y, 0.02), waterP.z);
+            bool bed = hz.depth > 0.0 && len < waterP.z;
+            vec3 bedA = materials[hz.bed].albedoEmissive.rgb;
+            vec3 aW = bed ? bedA * waterTrans(len) * (1.0 - F) * 0.8 : vec3(0.0);
+            imageStore(gbWater, pix, vec4(len, len * max(-rdR.y, 0.0), Nw.x, Nw.z));
+            imageStore(gbAlbedo, pix, vec4(aW, 0.0));
+            imageStore(gbNormal, pix, vec4(0.5, 1.0, 0.5, 1.0));
+            imageStore(gbPos, pix, vec4(P, hz.t));
+            STORE_MOTION(P, -1);
+            STORE_GUIDES_HIT(vec3(0.0, 1.0, 0.0), hz.t, aW, 0.9, 0.0);
+            STORE_HEAT;
+            return;
+        }
+#endif
+        if (hz.hit) {
+            vec3 P = camPos + rd * hz.t;
+            // Darker than the bare colour: the canopy's self-shadow and the ground's small
+            // detail (grass, stones) the heightfield doesn't have. A steep canopy is the skirt a
+            // heightfield hangs from a crown's rim to the ground - the shade under the trees.
+            // A crown block's side: leaves near its top, then the shade under the crowns (trunks, the forest's dark
+            // interior) - lit as leaves all the way down, the far trees stood as pale, ghostly pillars (Hugo)
+            float under = 1.0;
+            if (hz.canopy && hz.n.y < 0.5) under = mix(0.85, 0.5, smoothstep(10.0, 45.0, hz.top - P.y));
+            imageStore(gbAlbedo, pix, vec4(hz.albedo * (hz.canopy ? 0.6 : 0.8) * under, 0.0));
+            imageStore(gbNormal, pix, vec4(hz.n * 0.5 + 0.5, hz.canopy ? 0.8 : 1.0));
+            imageStore(gbPos, pix, vec4(P, hz.t));
+            STORE_MOTION(P, -1);
+            STORE_GUIDES_HIT(hz.n, hz.t, hz.albedo * (hz.canopy ? 0.6 : 0.8) * under, 0.9, 0.0);
+            STORE_HEAT;
+            return;
+        }
+    }
+    if (!h.hit) {
+#ifdef WATER_CLEAR
+        if (camWet) {   // the sky through the water, not through the surface (a side / level ray)
+            float tW = 0.0;
+            for (; tW < 256.0; tW += 1.0) if (voxelMatAt(camPos + rd * tW) != 5u) break;
+            imageStore(gbWater, pix, vec4(max(tW, 1e-3), -1.0, max(tW, 1e-3), 0.0));
+        }
+#endif
+        imageStore(gbAlbedo, pix, vec4(0));
+        imageStore(gbNormal, pix, vec4(0));
+        imageStore(gbPos, pix, vec4(0, 0, 0, -1.0));
+        // sky (and the clouds composited over it): it turns with the view - a direction at infinity reprojected
+        // (motion 0 smeared and jittered the clouds through DLSS / the temporal passes whenever you turned)
+        imageStore(gbMotion, pix, vec4(reprojMotion(prevCamPos + rd * 1e6, sampleC, res), 0.0, 0.0));
+        imageStore(gbDelta, pix, vec4(0.0));
+        STORE_GUIDES_SKY;
+        STORE_HEAT;
+        return;
+    }
+    Material mat = materials[h.mat];
+    vec3 Phit = camPos + rd * h.t;   // the G-buffer surface (under water: the bed)
+    vec3 Pmot = Phit;                 // the point the motion vector follows
+    int motObj = h.obj;
+    vec3 waterMul = vec3(1.0);
+#ifdef WATER_CLEAR
+    {
+        // y < 0: camera under water, the point seen is -(y + 1) below the surface (less light).
+        // .z = the in-water part of the straight view ray (what the froxel fog covers).
+        vec4 wOut = camWet ? vec4(h.t, -1.0 - waterAbove(Phit + h.normal * 0.5, 96), h.t, 0.0) : vec4(0.0);
+        if (camWet) waterMul = waterTrans(h.t);
+        if (exitMode > 0) {   // seen through the surface from below (window / mirror, above)
+            Phit = exitP;
+            Pmot = camPos + rd * tExit;
+            motObj = -1;
+            waterMul = exitMul;
+            wOut = exitW;
+        } else if (mat.props.z == 1.0) {
+            // Surface: animated wave normal on top faces, Fresnel; refract (IOR 1.33,
+            // wave normal damped by r.water.refract) and trace the bed, water skipped.
+            // The BED becomes this pixel's surface (lit, denoised, reprojected like any
+            // other); its albedo carries the view-path absorption and (1 - Fresnel).
+            // gbPos.w stays the SURFACE distance (fog, DLSS depth, footprints).
+            float fpS = h.t * 2.0 * tanHalfFov / float(res.y);
+            vec3 Nw = h.normal.y > 0.5 ? waterNormal(Phit.xz, time, fpS) : h.normal;
+            float F = waterFresnel(Nw, -rd);
+            vec3 rdR = refract(rd, normalize(mix(h.normal, Nw, waterP.y)), 1.0 / 1.33);
+            if (dot(rdR, rdR) < 0.5) rdR = rd;
+            Hit b = traceScenePrimary(Phit + rdR * 0.02, rdR, waterP.z, kSkipMat);
+            float hd; uint hbed;
+            if (!b.hit && horWaterAt(Phit.xz, hd, hbed)) {
+                // Out of the loaded chunks before the bed (the last stretch of water by their edge): the bed from the
+                // horizon's heightfield, as the water beyond is shaded - else a dark line along the edge (Hugo).
+                float lh = hd / max(-rdR.y, 0.02);
+                if (hd > 0.0 && lh < waterP.z && !horLoaded((Phit + rdR * lh).xz)) {
+                    b.hit = true; b.t = lh; b.mat = hbed; b.normal = vec3(0.0, 1.0, 0.0);
+                    b.cell = ivec3(floor(Phit + rdR * lh));
+                }
+            }
+            float len = b.hit ? b.t : waterP.z;
+            vec3 Pb = Phit + rdR * len;
+            wOut = vec4(len, max(Phit.y - Pb.y, 0.0), Nw.x, Nw.z);
+            // 0.8: wet surfaces are darker. Too deep: the body colour only (water_refl).
+            waterMul = b.hit ? waterTrans(len) * (1.0 - F) * 0.8 : vec3(0.0);
+            Pmot = Phit;
+            motObj = -1;
+            if (b.hit) {
+                h.mat = b.mat; h.normal = b.normal; h.cell = b.cell;
+                mat = materials[b.mat];
+            } else {
+                h.normal = vec3(0.0, 1.0, 0.0);
+            }
+            Phit = Pb;
+        }
+        imageStore(gbWater, pix, wOut);
+    }
+#endif
+    vec3 albedo = mat.albedoEmissive.rgb;
+    // Debug: flat distinct color per object (world = grey). If an object shows
+    // MULTIPLE colors, it's reading another object's grid/atlas (corruption).
+    if (debugMode == 1) {
+        if (h.obj < 0) albedo = vec3(0.5);
+        else {
+            uint c = pcgHash(uint(h.obj + 1));
+            albedo = vec3(float(c & 255u), float((c >> 8) & 255u),
+                          float((c >> 16) & 255u)) / 255.0 * 0.8 + 0.15;
+        }
+        imageStore(gbAlbedo, pix, vec4(albedo, 0.0));
+        imageStore(gbNormal, pix, vec4(h.normal * 0.5 + 0.5, 1.0));
+        imageStore(gbPos, pix, vec4(camPos + rd * h.t, h.t));
+        STORE_MOTION(camPos + rd * h.t, h.obj);
+        STORE_GUIDES_HIT(h.normal, h.t, albedo, 0.9, 0.0);
+        STORE_HEAT;
+        return;
+    }
+    // Per-voxel shade variation: deterministic hash of the hit voxel's local
+    // cell (stable — sticks to the voxel even on moving objects). Mostly value
+    // jitter plus a subtle warm/cool tint so surfaces read as textured.
+    // SHADING LOD: pixel footprint in voxels. Detail smaller than a pixel can't be
+    // resolved, only aliased (= shimmer in motion), so it is prefiltered toward its
+    // mean as it shrinks below a pixel.
+    float fp = h.t * 2.0 * tanHalfFov / float(res.y);
+    float roughV = mat.surf.x, metalV = mat.surf.y;
+    float j = mat.props.y * (1.0 - smoothstep(0.6, 1.6, fp));   // per-voxel variation -> mean
+    if (j > 0.0) {
+        // (x / z wrapped to the floating origin's step: a voxel keeps its shade through a rebase)
+        uint hsh = pcgHash(uint((h.cell.x & 0xFFFF) * 73856093) ^ uint(h.cell.y * 19349663) ^
+                           uint((h.cell.z & 0xFFFF) * 83492791));
+        float v = float(hsh & 1023u) * (1.0 / 1023.0);
+        float w = float((hsh >> 10) & 1023u) * (1.0 / 1023.0);
+        albedo *= 1.0 + j * (v * 2.0 - 1.0);
+        float tint = j * 0.35 * (w * 2.0 - 1.0);
+        albedo = clamp(albedo * vec3(1.0 + tint, 1.0, 1.0 - tint), 0.0, 1.0);
+        // ... and its roughness (a voxel a little shinier or duller than the next)
+        roughV = clamp(roughV + (float((hsh >> 20) & 1023u) * (1.0 / 1023.0) - 0.5) * 0.16 * (j / max(mat.props.y, 1e-3)), 0.02, 1.0);
+    }
+    vec3 N = h.normal;
+    // Per-voxel facets (r.facets): each voxel face's shading normal tilted its own small way, flat across the face -
+    // as if every block sat a little differently, so in the sun some voxels light up and others go a shade darker
+    // (Lay of the Land's ground and foliage). The amount per material (common.glsl facetAmount), faded with the
+    // footprint like the colour variation.
+    {
+        float fk = facetP.x * facetAmount(uint(mat.surf.w + 0.5)) * (1.0 - smoothstep(0.6, 1.6, fp));
+        if (fk > 0.0) {
+            uint fh = pcgHash(uint((h.cell.x & 0xFFFF) * 19349663) ^ uint(h.cell.y * 83492791) ^
+                              uint((h.cell.z & 0xFFFF) * 73856093) ^ uint(dot(h.normal, vec3(1.0, 2.0, 3.0)) + 3.5) * 2654435761u);
+            gFacet = (vec2(float(fh & 1023u), float((fh >> 10) & 1023u)) * (2.0 / 1023.0) - 1.0) * fk;
+        }
+    }
+    // gbNormal.a: 1 = plain surface, 0 = water (legacy shading), 0.8 = foliage voxel,
+    // 0.7 = grass blade (thin: light passes through, r.foliage.sss).
+    float matFlag = mat.props.z == 3.0 ? 0.8 : 1.0;
+#ifdef GRASS_ON
+    // Prefiltered far grass: beyond the blade draw distance the grass ground takes
+    // the mean blade colour, weighted by the expected blade coverage along the view
+    // ray (grazing -> mostly blades, top-down -> mostly ground). Matches the blade
+    // fade band, so there is no visible line where blades end.
+    // (not on a lake bed seen through the water: no blades grow there)
+    if (mat.props.z == 2.0 && h.normal.y > 0.5 && all(equal(waterMul, vec3(1.0)))) {
+        float gEnd = grassDist * max(optP.y, 1.0);   // where blades / far tufts end
+        float far = smoothstep(0.7 * gEnd, gEnd, h.t);
+        albedo = grassFarColour(albedo, Phit.xz, uint(mat.props.w), rd.y, far);
+    }
+#endif
+#ifndef WATER_CLEAR
+    if (mat.props.z == 1.0 && h.normal.y > 0.5) {   // water TOP surface -> waves
+        N = waterNormal((camPos + rd * h.t).xz, time, fp);
+        matFlag = 0.0;
+        albedo = vec3(0.04, 0.13, 0.26);            // dark water body; reflection adds the rest
+    }
+#endif
+    // Rain: open ground gets wet - darker, and glossy (the reflections take it from there). Not under a roof or water.
+    if (rainA.z > 0.01 && h.obj < 0 && all(equal(waterMul, vec3(1.0))) && mat.props.z != 3.0) {
+        float wet = rainA.z * skyOpen(Phit + h.normal * 1.5) * (h.normal.y > 0.5 ? 1.0 : 0.6);
+        albedo *= mix(1.0, 0.68, wet);
+        roughV = mix(roughV, 0.22, wet * 0.85);
+    }
+    float emit = mat.albedoEmissive.a;
+    if (emit > 0.0 && (mat.props.w > 0.5 || h.obj >= 0)) {   // flickering / pulsing / damaged glow
+        bool body = h.obj >= 0;
+        emit *= lightAnim(mat.props.w, body ? lightPhaseBody(h.obj) : lightPhaseAt(vec3(h.cell) + 0.5), time,
+                          body ? objs[h.obj].aabbMin.w : 1.0);
+    }
+    imageStore(gbAlbedo, pix, vec4(albedo * waterMul, emit * 0.125 * waterMul.g));
+    imageStore(gbNormal, pix, vec4(N * 0.5 + 0.5, matFlag));
+    imageStore(gbPos, pix, vec4(Phit, h.t));
+    STORE_MOTION(Pmot, motObj);
+    STORE_GUIDES_HIT(N, h.t, albedo * waterMul, roughV, metalV);
+    STORE_HEAT;
+}

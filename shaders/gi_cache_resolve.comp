@@ -1,0 +1,55 @@
+// Radiance cache (r.gi.cache, common.glsl GI_CACHE), once a frame before anything reads it: each cell's
+// samples of the last frame (update rays + the lookups that traced bounce 2 themselves) folded into its
+// value - a running mean over at most giCacheQ.x samples, so it follows the sun, edits and bodies; cells
+// unused for giCacheQ.y frames are dropped (16 while the table is over half full: a fast flight makes new
+// patches quicker than the usual age frees them). Thread 0 sizes the update pass (last frame's queue) and
+// empties this frame's queue. Patches near this frame's world edits (boxes grown by r.gi.cache.editreach),
+// or all of them after a jump of the sun, start over: their next lookups trace bounce 2 until they are warm
+// again. Live patches are counted per frame (gcLive[frame % 3]) for that and for r.gi.cache.stats.
+
+layout(local_size_x = 64) in;
+layout(push_constant) uniform GiCacheResolvePC {
+    vec4 boxLo[3];   // world edits (voxels)
+    vec4 boxHi[3];
+    int nBox;        // -1: reset every patch
+};
+
+shared uint sLive;
+
+void main() {
+#ifdef GI_CACHE
+    uint f = uint(giCacheP.x);
+    uint i = gl_GlobalInvocationID.x;
+    if (gl_LocalInvocationIndex == 0u) sLive = 0u;
+    barrier();
+    if (i == 0u) {
+        uint n = min(gcCount[(f + 1u) & 1u], uint(giCacheP.w));
+        gcArgs[0] = (n + 63u) / 64u; gcArgs[1] = 1u; gcArgs[2] = 1u;
+        gcCount[f & 1u] = 0u;
+        gcLive[(f + 1u) % 3u] = 0u;   // (two frames old: next frame counts into it)
+    }
+    float maxAge = gcLive[(f + 2u) % 3u] > kGiCacheSize / 2u ? min(giCacheQ.y, 16.0) : giCacheQ.y;   // last frame's
+    if (i < kGiCacheSize && giCache[i].check != 0u) {
+        GiCacheEntry e = giCache[i];
+        if (float(f - e.lastUsed) > maxAge) {   // unused: free the slot
+            giCache[i] = GiCacheEntry(0u, 0u, 0u, 0u, uvec4(0u), vec4(0.0), vec4(0.0));
+        } else {
+            atomicAdd(sLive, 1u);
+            bool reset = nBox < 0;
+            for (int b = 0; b < nBox; ++b)
+                reset = reset || all(greaterThanEqual(e.pos.xyz, boxLo[b].xyz)) && all(lessThanEqual(e.pos.xyz, boxHi[b].xyz));
+            if (reset) { e.val.w = 0.0; giCache[i].val.w = 0.0; }
+            uint n = min(e.accN, 64u);
+            if (n > 0u) {
+                vec3 mean = vec3(e.acc.xyz) * (1.0 / 65536.0) / float(n);
+                float total = min(e.val.w + float(n), giCacheQ.x);
+                giCache[i].val = vec4(e.val.rgb + (mean - e.val.rgb) * min(float(n) / total, 1.0), total);
+                giCache[i].accN = 0u;
+                giCache[i].acc.xyz = uvec3(0u);
+            }
+        }
+    }
+    barrier();
+    if (gl_LocalInvocationIndex == 0u && sLive > 0u) atomicAdd(gcLive[f % 3u], sLive);
+#endif
+}

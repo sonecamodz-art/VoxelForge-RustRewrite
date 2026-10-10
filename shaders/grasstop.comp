@@ -1,0 +1,148 @@
+// Grass top map for the procedural blade layer (shaders/grass.glsl) + the sky height map (skyTop).
+//   pass 0: per world column (x,z): Y of the top face of the highest GRASS voxel
+//           with air directly above it (0 = no grass) in bits 0-11, and the grass
+//           variant (material props.w: 0 lush, 1 dry, 2 moss, 3 flowers) in bits 12-15. Scans
+//           down the brick grid, skipping empty bricks, so grass under tree canopies
+//           is found too.
+//           Also bakes the column's grass PLACEMENT fields into grassInfo (they only
+//           depend on position + variant, so the per-ray blade walk just fetches them):
+//             x = blade count (bits 0-1) | dryness (bits 2-7), y = clump edge (0..255),
+//             z = direction away from the clump centre (angle), w = clump height x 160.
+//   pass 1: per 8x8-column tile: (min, max) of the non-zero heights, for skipping.
+// Only the rect [lo, hi] is (re)built — edits rebuild the dirty columns.
+// Standalone (no common.glsl); compiled with an empty preamble.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform usampler3D gridTex;
+layout(set = 0, binding = 1) uniform usampler3D atlasTex;
+struct Material { vec4 albedoEmissive; vec4 props; vec4 surf; };   // props.z == 2 -> grass kind (world.h)
+layout(std430, set = 0, binding = 2) readonly buffer Palette { Material materials[256]; };
+layout(set = 0, binding = 3, r16ui) uniform uimage2D grassTop;
+layout(set = 0, binding = 4, rg16ui) uniform uimage2D grassTile;
+layout(set = 0, binding = 5, rgba8ui) uniform uimage2D grassInfo;
+// Sky height per column (pass 0, same scan): Y of the top face of the highest voxel that blocks the
+// sky - anything but air, water (kind 1) and foliage (kind 3; leaves let skylight through gaps).
+// 0 = nothing. common.glsl skyOpen() reads it (light that can't reach the sky is dark).
+layout(set = 0, binding = 6, r16ui) uniform uimage2D skyTop;
+
+layout(push_constant) uniform PC {
+    ivec2 lo; ivec2 hi;       // pass 0: columns; pass 1: tiles (inclusive)
+    int pass; int atlasBX; int atlasBY; int ring;   // ring: a streaming world - lo / hi are ABSOLUTE
+} pc;                                               // columns / tiles, the textures toroidal
+
+ivec2 colW(ivec2 c) { return pc.ring != 0 ? c & (imageSize(grassTop) - 1) : c; }
+ivec2 tileW(ivec2 t) { return pc.ring != 0 ? t & (imageSize(grassTile) - 1) : t; }
+
+uint voxelAt(uint g, ivec3 local) {
+    if (g < 256u) return g;                      // uniform brick
+    uint slot = g - 256u;
+    ivec3 base = ivec3(int(slot % uint(pc.atlasBX)), int((slot / uint(pc.atlasBX)) % uint(pc.atlasBY)),
+                       int(slot / uint(pc.atlasBX * pc.atlasBY))) * 8;
+    return texelFetch(atlasTex, base + local, 0).r;
+}
+
+// --- placement fields (was evaluated per ray step in grass.glsl) ---------------
+float gHash(vec2 p, float s) {
+    p = fract(p * vec2(0.1031, 0.1030) + s * 0.0973);
+    p += dot(p, p.yx + 33.33);
+    return fract((p.x + p.y) * p.x);
+}
+vec2 gHash2(vec2 p) {
+    vec3 q = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973));
+    q += dot(q, q.yzx + 33.33);
+    return fract((q.xx + q.yz) * q.zy);
+}
+float gNoise(vec2 p) {
+    vec2 i = floor(p), f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float a = gHash(i, 11.0), b = gHash(i + vec2(1, 0), 11.0);
+    float c = gHash(i + vec2(0, 1), 11.0), d = gHash(i + vec2(1, 1), 11.0);
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+// Must match gDensity() in grass.glsl (the far prefilter uses it per pixel).
+float gDensity(vec2 xz) { return smoothstep(0.2, 0.68, gNoise(xz * 0.05 + 17.0)); }
+float variantDens(uint v) { return v == 1u ? 0.90 : v == 2u || v == 3u ? 1.00 : v == 4u ? 0.95 : v == 5u ? 0.80 : 1.05; }   // = GVariant.dens (grass.glsl)
+const int kMaxBlades = 3;
+
+// Clumps (Ghost of Tsushima, GDC 2021): jittered cellular field of ~3.5-voxel
+// clumps (nearest of the 2x2 candidate seeds on the query's side); each clump has
+// its own height, dryness; blades thin out + shorten toward the edge and lean away
+// from the centre. Density: ~20-voxel noise (lush patches, thin areas, bare
+// spots). Height: ~90-voxel noise (tall meadows vs short turf).
+uvec4 bakeInfo(ivec2 c, uint variant) {
+    vec2 xz = vec2(c) + 0.5;
+    float densField = gDensity(xz);
+    float rnd = gHash(xz, 21.0);
+    vec2 q = xz / 3.5;
+    vec2 iq = floor(q), fq = fract(q);
+    vec2 o = step(0.5, fq) - 1.0;
+    float best = 1e9; vec2 bestP = vec2(0.0), bestId = vec2(0.0);
+    for (int j = 0; j < 4; j++) {
+        vec2 id = iq + o + vec2(j & 1, j >> 1);
+        vec2 p = id + 0.5 + (gHash2(id) - 0.5) * 0.9;
+        vec2 dv = p - q;
+        float d2 = dot(dv, dv);
+        if (d2 < best) { best = d2; bestP = p; bestId = id; }
+    }
+    float dist = sqrt(best);
+    float edge = smoothstep(0.15, 0.85, dist);
+    vec2 away = dist > 1e-3 ? (q - bestP) / dist : vec2(1.0, 0.0);
+    float heightMacro = mix(0.55, 1.25, smoothstep(0.25, 0.75, gNoise(xz * 0.011 + 3.0)));
+    float clumpH = mix(0.55, 1.2, gHash(bestId, 9.0)) * heightMacro;
+    float dens = densField * variantDens(variant) * mix(1.0, 0.3, edge);
+    uint n = uint(min(int(dens * float(kMaxBlades) + 0.15 + rnd), kMaxBlades));
+    float dry = clamp(gHash(bestId, 13.0) * 0.6 + (1.0 - densField) * 0.5, 0.0, 1.0);
+    float ang = atan(away.y, away.x) / 6.2831853 + 0.5;
+    return uvec4(n | (uint(dry * 63.0 + 0.5) << 2), uint(edge * 255.0 + 0.5),
+                 uint(ang * 255.0 + 0.5) & 255u, uint(min(clumpH * 160.0, 255.0)));
+}
+
+void main() {
+    ivec2 c = pc.lo + ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThan(c, pc.hi))) return;
+
+    if (pc.pass == 1) {   // tile min/max
+        uint mn = 0xFFFFu, mx = 0u;
+        bool tall = false;   // tall meadow grass (variant 4): the tile's band is taller (grass.glsl)
+        for (int z = 0; z < 8; z++)
+            for (int x = 0; x < 8; x++) {
+                uint raw = imageLoad(grassTop, colW(c * 8 + ivec2(x, z))).r;
+                uint h = raw & 0xFFFu;
+                if (h == 0u) continue;
+                mn = min(mn, h);
+                mx = max(mx, h);
+                tall = tall || (raw >> 12) == 4u || (raw >> 12) == 5u;
+            }
+        imageStore(grassTile, tileW(c), mx == 0u ? uvec4(0u) : uvec4(mn, mx | (tall ? 0x8000u : 0u), 0u, 0u));
+        return;
+    }
+
+    int wby = textureSize(gridTex, 0).y;
+    ivec2 bxz = c >> 3;
+    if (pc.ring != 0) bxz &= textureSize(gridTex, 0).xz - 1;
+    ivec2 lxz = c & 7;
+    bool airAbove = true;
+    uint result = 0u, sky = 0u;
+    for (int by = wby - 1; by >= 0 && result == 0u; by--) {
+        // (32 m under the sky surface: no grass there that could grow - under the tallest crowns it is closer; stops the
+        // scan running down a tall world's whole stone column)
+        if (sky != 0u && by * 8 < int(sky) - 320) break;
+        uint g = texelFetch(gridTex, ivec3(bxz.x, by, bxz.y), 0).r;
+        if (g == 0u) { airAbove = true; continue; }
+        for (int ly = 7; ly >= 0; ly--) {
+            uint m = voxelAt(g, ivec3(lxz.x, ly, lxz.y));
+            if (m == 0u) { airAbove = true; continue; }
+            float kind = materials[m].props.z;
+            if (sky == 0u && kind != 1.0 && kind != 3.0) sky = uint(by * 8 + ly + 1);   // (grass is kind 2: found first)
+            if (airAbove && materials[m].props.z == 2.0) {
+                result = uint(by * 8 + ly + 1) | (uint(materials[m].props.w) << 12);
+                break;
+            }
+            airAbove = false;
+        }
+    }
+    imageStore(grassTop, colW(c), uvec4(result));
+    imageStore(skyTop, colW(c), uvec4(sky));
+    imageStore(grassInfo, colW(c), result == 0u ? uvec4(0u) : bakeInfo(c, result >> 12));   // hashes: absolute column
+}

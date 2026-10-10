@@ -1,0 +1,6 @@
+/target
+/shader_cache
+/logs
+/settings.cfg
+*.png
+*.bmp

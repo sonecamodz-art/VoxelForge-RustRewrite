@@ -1,0 +1,95 @@
+// SVGF pass 5b: temporal STABILISATION of the à-trous-filtered half-res GI (the
+// "TemporalStabilization" step of NVIDIA ReBLUR / SIGMA). The temporal accumulation
+// in gi.comp runs BEFORE the spatial filter, so every frame the à-trous result moves
+// a little (a new 1-spp sample changes the history by 1/48 and shifts the luminance
+// edge-stops) — that residual is the still-camera crawl, measured as ~all of the
+// SVGF path's flicker. This pass keeps a second, short history of the FILTERED
+// signal and blends toward it, clamped to the current frame's local neighbourhood
+// (mean ± gamma·sigma, like TAA) so real lighting changes pass straight through and
+// nothing ghosts. .a = this history's length (frames), capped at kMaxLen.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rgba16f, SET(3) binding = 0) uniform writeonly image2D giStabCur;
+
+layout(SET(3) binding = 1) uniform sampler2D giCur;         // half-res à-trous output
+layout(SET(3) binding = 2) uniform sampler2D giStabPrev;    // half-res, last frame
+layout(SET(3) binding = 3) uniform sampler2D gbNormal;      // full-res
+layout(SET(3) binding = 4) uniform sampler2D gbPos;         // full-res
+layout(SET(3) binding = 5) uniform sampler2D gbPosPrev;     // full-res (validation)
+layout(SET(3) binding = 6) uniform sampler2D gbNormalPrev;  // full-res (validation)
+layout(SET(3) binding = 7) uniform sampler2D gbMotion;      // full-res prevUV - curUV
+layout(SET(3) binding = 8) uniform sampler2D gbDelta;       // full-res P - Pprev
+layout(SET(3) binding = 9) uniform usampler2D giGuide;      // half-res filter guide
+
+BEGIN_PASS_UNIFORMS
+PASS_UNIFORMS_BODY
+END_PASS_UNIFORMS
+
+layout(push_constant) uniform PC { float gamma; float maxLen; float minAlpha; float pad; } pc;
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 res = imageSize(giStabCur);    // half-res
+    if (pix.x >= res.x || pix.y >= res.y) return;
+    ivec2 fullRes = textureSize(gbPos, 0);
+
+    Guide g = unpackGuide(texelFetch(giGuide, pix, 0));
+    vec3 cur = texelFetch(giCur, pix, 0).rgb;
+    if (g.sky) { imageStore(giStabCur, pix, vec4(0.0)); return; }
+
+    // Neighbourhood statistics of the current filtered GI (same surface only), in
+    // luma-normalised space so dark and bright regions clamp alike.
+    vec3 m1 = vec3(0.0), m2 = vec3(0.0);
+    float n = 0.0;
+    for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++) {
+            ivec2 q = clamp(pix + ivec2(dx, dy), ivec2(0), res - 1);
+            Guide gq = unpackGuide(texelFetch(giGuide, q, 0));
+            if (gq.sky || dot(gq.N, g.N) < 0.8) continue;
+            vec3 c = texelFetch(giCur, q, 0).rgb;
+            m1 += c; m2 += c * c; n += 1.0;
+        }
+    m1 /= n; m2 /= n;
+    vec3 sigma = sqrt(max(m2 - m1 * m1, vec3(0.0)));
+
+    // Reproject (same validated-bilinear scheme as gi.comp: each tap must lie on the
+    // plane this point was on last frame, with a similar normal).
+    ivec2 fc = repTexel(gbPos, pix, fullRes);
+    vec4 posT = texelFetch(gbPos, fc, 0);
+    vec3 N = g.N;
+    vec2 puv = (vec2(pix) + 0.5) / vec2(res) + texelFetch(gbMotion, fc, 0).xy;
+    vec3 Pprev = posT.xyz - texelFetch(gbDelta, fc, 0).xyz;
+    vec2 fp = puv * vec2(res) - 0.5;
+    ivec2 b = ivec2(floor(fp));
+    vec2 fr = fp - vec2(b);
+    vec4 hSum = vec4(0.0);
+    float wSum = 0.0;
+    float tol = 0.5 + posT.w * 0.004;
+    for (int k = 0; k < 4; k++) {
+        ivec2 q = b + ivec2(k & 1, k >> 1);
+        if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, res))) continue;
+        ivec2 fq = repTexel(gbPosPrev, q, fullRes);
+        vec4 prevP = texelFetch(gbPosPrev, fq, 0);
+        prevP.xyz += shiftP.xyz;   // (a floating-origin rebase since)
+        if (prevP.w <= 0.0) continue;
+        vec3 prevN = texelFetch(gbNormalPrev, fq, 0).xyz * 2.0 - 1.0;
+        if (abs(dot(prevP.xyz - Pprev, N)) >= tol || dot(prevN, N) <= 0.85) continue;
+        float w = ((k & 1) != 0 ? fr.x : 1.0 - fr.x) * ((k >> 1) != 0 ? fr.y : 1.0 - fr.y);
+        hSum += texelFetch(giStabPrev, q, 0) * w;
+        wSum += w;
+    }
+    vec3 outc = cur;
+    float len = 1.0;
+    if (wSum > 1e-3) {
+        vec4 h = hSum / wSum;
+        // Clamp the history into the current neighbourhood's box: a lighting change
+        // (edit, moving sun, a body) larger than the local noise wins immediately.
+        vec3 lo = m1 - pc.gamma * sigma - 1e-3, hi = m1 + pc.gamma * sigma + 1e-3;
+        vec3 hc = clamp(h.rgb, lo, hi);
+        len = min(h.a + 1.0, pc.maxLen);
+        float a = max(1.0 / len, pc.minAlpha);
+        outc = mix(hc, cur, a);
+    }
+    imageStore(giStabCur, pix, vec4(outc, len));
+}

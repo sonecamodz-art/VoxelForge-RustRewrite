@@ -1,0 +1,140 @@
+// Pass 2: stochastic sampling + temporal accumulation of the FULL-res sun shadow
+// (no shading — that's the denoise pass). Per pixel per frame: 1 jittered sun-
+// shadow ray, blended into a reprojected history (shadow, -, count). History is
+// rejected on plane-distance AND normal mismatch so silhouettes and moving
+// surfaces restart cleanly instead of ghosting. The (low-frequency) 1-bounce GI
+// lives in the separate half-res gi.comp pass.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rgba32f, SET(3) binding = 1) uniform writeonly image2D histCur;   // shadow, -, count
+
+layout(SET(3) binding = 2) uniform sampler2D gbAlbedo;
+layout(SET(3) binding = 3) uniform sampler2D gbNormal;
+layout(SET(3) binding = 4) uniform sampler2D gbPos;
+layout(SET(3) binding = 5) uniform sampler2D gbPosPrev;
+layout(SET(3) binding = 6) uniform sampler2D histPrev;
+layout(SET(3) binding = 7) uniform sampler2D gbNormalPrev;
+layout(SET(3) binding = 9) uniform sampler2D gbMotion;    // prevUV - curUV
+layout(SET(3) binding = 10) uniform sampler2D gbDelta;    // P - Pprev (moving bodies)
+
+BEGIN_PASS_UNIFORMS
+PASS_UNIFORMS_BODY
+END_PASS_UNIFORMS
+
+#ifdef DEBUG_HEAT
+layout(rgba16f, SET(3) binding = 8) uniform image2D dbgHeat;   // .y = shadow-ray steps
+#endif
+
+const float kMaxHistory = 48.0;  // frames of accumulation (longer = smoother)
+const float kFastAlpha = 0.25;   // fast history ~ last 4 frames
+const float kAntiLagK = 3.0;     // clamp band, in std-devs of the fast history
+const float kFastSigmaScale = 0.378;   // std of a 4-frame EMA / per-sample std: sqrt(a/(2-a))
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 res = imageSize(histCur);
+    if (pix.x >= res.x || pix.y >= res.y) return;
+
+    vec4 posT = texelFetch(gbPos, pix, 0);
+    if (posT.w < 0.0) { // sky
+        imageStore(histCur, pix, vec4(1.0, 1.0, 0.0, 0.0));
+        return;
+    }
+
+    vec3 P = posT.xyz;
+    vec3 N = texelFetch(gbNormal, pix, 0).xyz * 2.0 - 1.0;
+
+    // Per-pixel, per-frame seed (decorrelates rays across space and time).
+    uint seed = pixelSeed(pix, frameIdx, 0u);
+
+    // 1 sun-shadow ray, jittered across the sun disk. Under water: from where the refracted
+    // sunlight came in (common.glsl sunUnderwater).
+#ifdef WATER_CLEAR
+    float wDepth = waterDepthAt(P + N * 0.5);
+    float ndl = max(dot(N, wDepth > 0.0 ? sunDirWater() : sunDir), 0.0);
+#else
+    float wDepth = 0.0;
+    float ndl = max(dot(N, sunDir), 0.0);
+#endif
+    // One sun-visibility call site for both cases (a lit face, or a back-lit leaf / blade: the sun
+    // reaching it from behind, transmission) - each site inlined a traversal loop that weighed on
+    // every pixel's occupancy. Same rays and random numbers as two sites.
+    float shadow = 0.0;
+    bool sunRay = ndl > 0.0, lit = ndl > 0.0;
+    vec3 so = P + N * 3e-2;
+#ifdef FOLIAGE_SSS
+    if (!lit) {
+        float fa = texelFetch(gbNormal, pix, 0).a;
+        if (isFoliageFlag(fa) && sunDir.y > 0.0) { sunRay = true; so = foliageSunOrigin(P, N, isBladeFlag(fa)); }
+    }
+#endif
+    if (sunRay) {
+        vec3 sd = sampleCone(sunDir, sunAngle, seed);
+        bool blocked = false;
+#ifdef WATER_CLEAR
+        if (lit && wDepth > 0.0) so = sunUnderwater(so, wDepth, blocked);
+#endif
+#ifdef FOLIAGE_LIGHT
+        shadow = blocked ? 0.0 : sunVisibility(so, sd, lookP.w, seed, true);   // light through leaves
+#else
+        shadow = blocked || occludedShadow(so, sd, 1e30, kSkipMat) ? 0.0 : 1.0;
+#endif
+        if (lit && shadow > 0.0) shadow *= grassSunVis(P, N, camPos, time, prevTime);   // blade shadows (r.grass.shadows)
+    }
+#ifdef DEBUG_HEAT
+    {
+        vec4 hv = imageLoad(dbgHeat, pix);
+        imageStore(dbgHeat, pix, vec4(hv.x, float(gSteps), 0.0, 0.0));
+    }
+#endif
+
+    // Reproject into the previous frame through the motion vector (true surface
+    // motion, incl. moving bodies) and fetch history BILINEARLY: each of the 4 taps
+    // is validated on its own (coplanar with where this point was last frame +
+    // similar normal), so history survives right up to silhouettes instead of a
+    // single nearest texel rejecting the whole pixel. The shadow's 2nd moment
+    // accumulates alongside (.y) so the denoiser can variance-guide it.
+    float count = 0.0;
+    float sAcc = shadow;
+    float sM2 = shadow * shadow;
+    float sFast = shadow;   // .w: ~4-frame "fast" history (ReLAX anti-lag reference)
+    // From the pixel CENTRE, not the jittered sample: sub-pixel jitter is sampling
+    // noise, not motion. (Reprojecting the jittered position re-filters the history
+    // bilinearly every frame even with a still camera -> it slowly blurs.)
+    vec2 puv = (vec2(pix) + 0.5) / vec2(res) + texelFetch(gbMotion, pix, 0).xy;
+    vec3 Pprev = P - texelFetch(gbDelta, pix, 0).xyz;   // where this point was
+    vec2 fp = puv * vec2(res) - 0.5;
+    ivec2 b = ivec2(floor(fp));
+    vec2 fr = fp - vec2(b);
+    vec4 hSum = vec4(0.0);
+    float wSum = 0.0;
+    float tol = 0.5 + posT.w * 0.004;   // plane tolerance grows with distance
+    for (int k = 0; k < 4; k++) {
+        ivec2 q = b + ivec2(k & 1, k >> 1);
+        if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, res))) continue;
+        vec4 prevP = texelFetch(gbPosPrev, q, 0);
+        prevP.xyz += shiftP.xyz;   // (a floating-origin rebase since)
+        if (prevP.w <= 0.0) continue;
+        vec3 prevN = texelFetch(gbNormalPrev, q, 0).xyz * 2.0 - 1.0;
+        if (abs(dot(prevP.xyz - Pprev, N)) >= tol || dot(prevN, N) <= 0.85) continue;
+        float w = ((k & 1) != 0 ? fr.x : 1.0 - fr.x) * ((k >> 1) != 0 ? fr.y : 1.0 - fr.y);
+        hSum += texelFetch(histPrev, q, 0) * w;
+        wSum += w;
+    }
+    if (wSum > 1e-3) {
+        vec4 hist = hSum / wSum;
+        count = min(hist.z, kMaxHistory);
+        float w = 1.0 / (count + 1.0);
+        sFast = mix(hist.w, shadow, max(w, kFastAlpha));
+        // Anti-lag (NRD ReLAX): the long history may not stray further from the fast
+        // one than its own noise explains. Geometry validation alone let a moving
+        // body's shadow trail on static ground for up to kMaxHistory frames.
+        float sigma = sqrt(max(hist.y - hist.x * hist.x, 0.0));
+        float band = kAntiLagK * sigma * kFastSigmaScale + 0.02;
+        float slow = clamp(hist.x, sFast - band, sFast + band);
+        sAcc = mix(slow, shadow, w);
+        sM2 = mix(hist.y, shadow * shadow, w);
+    }
+    imageStore(histCur, pix, vec4(sAcc, sM2, count + 1.0, sFast));
+}

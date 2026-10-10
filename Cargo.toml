@@ -1,0 +1,33 @@
+[package]
+name = "voxelforge"
+version = "0.1.0"
+edition = "2024"
+description = "VoxelForge: a GPU ray-traced voxel engine (Vulkan compute), rewritten in Rust"
+
+[dependencies]
+ash = { version = "0.38", default-features = false, features = ["loaded", "debug", "std"] }
+ash-window = "0.13"
+bytemuck = { version = "1.25", features = ["derive"] }
+glam = "0.29"
+gpu-allocator = { version = "0.27", default-features = false, features = ["vulkan"] }
+log = { version = "0.4", features = ["std"] }
+parking_lot = "0.12"
+png = "0.17"
+raw-window-handle = "0.6"
+rayon = "1.12"
+shaderc = "0.8"
+winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }
+
+[profile.dev]
+opt-level = 1
+
+# World generation and voxel packing are heavy: keep dependencies fast in debug builds too.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+debug = "line-tables-only"

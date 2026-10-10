@@ -1,0 +1,35 @@
+// Froxel volumetric fog, pass 2: INTEGRATE each screen tile's column front to back
+// (Hillaire's energy-conserving form: a slice of length L with constant source S and
+// extinction e adds S (1 - exp(-e L)) / e, attenuated by everything in front). Output per
+// froxel = (in-scatter accumulated from the camera to the slice's FAR edge .rgb,
+// transmittance over that distance .a); fogSample (common.glsl) reads it at a pixel's
+// own depth.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rgba16f, SET(3) binding = 0) uniform writeonly image3D froxVol;
+layout(SET(3) binding = 1) uniform sampler3D froxLight;   // froxel_inject.comp output
+
+BEGIN_PASS_UNIFORMS
+PASS_UNIFORMS_BODY
+END_PASS_UNIFORMS
+
+void main() {
+    ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
+    ivec3 dims = imageSize(froxVol);
+    if (xy.x >= dims.x || xy.y >= dims.y) return;
+    vec3 scatter = vec3(0.0);
+    float trans = 1.0;
+    float dPrev = 0.0;
+    for (int s = 0; s < dims.z; s++) {
+        vec4 v = texelFetch(froxLight, ivec3(xy, s), 0);
+        float dFar = froxelDepth(float(s + 1), fogP);
+        float len = dFar - dPrev;
+        float e = max(v.a, 1e-7);
+        float tr = exp(-e * len);
+        scatter += trans * v.rgb * ((1.0 - tr) / e);
+        trans *= tr;
+        dPrev = dFar;
+        imageStore(froxVol, ivec3(xy, s), vec4(scatter, trans));
+    }
+}

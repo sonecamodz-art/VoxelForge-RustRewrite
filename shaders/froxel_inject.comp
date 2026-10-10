@@ -1,0 +1,159 @@
+// Froxel volumetric fog, pass 1: INJECT (Wronski, AC4 2014; Hillaire, Frostbite 2015;
+// Unreal's Volumetric Fog). The camera frustum is a 3D grid: x, y = screen tiles, z =
+// exponential distance slices (froxelDepth, common.glsl). Per froxel: fog density at a
+// point jittered inside it (different every frame: a per-froxel random rotation of the
+// R2 sequence, so no screen-space pattern), lit by the sun / moon (one shadow ray, or the
+// Standard shadow map) with the Henyey-Greenstein phase, plus ambient. Stored as
+// (in-scatter source per voxel of length .rgb, extinction .a) and blended with last
+// frame's volume at the same world point (reprojected through the previous camera), so
+// the jittered samples average into a smooth, stable volume.
+// froxel_integrate.comp then accumulates it front to back; the shading passes read the
+// result at each pixel's own depth (fogSample) — nothing can bleed across a silhouette.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(rgba16f, SET(3) binding = 0) uniform writeonly image3D froxOut;
+layout(SET(3) binding = 1) uniform sampler3D froxHist;   // last frame's froxOut (linear)
+layout(SET(3) binding = 2) uniform sampler2D tileDepth;  // farthest surface per tile (froxel_tiles.comp)
+
+BEGIN_PASS_UNIFORMS
+PASS_UNIFORMS_BODY
+END_PASS_UNIFORMS
+
+const float kHistory = 0.9;    // ~10-frame accumulation
+
+// Density noise: same as fog.comp (drifting wisps, r.fog.noise).
+float fxHash(vec3 p) {
+    p = fract(p * vec3(0.1031, 0.1030, 0.0973));
+    p += dot(p, p.yzx + 33.33);
+    return fract((p.x + p.y) * p.z);
+}
+float fxNoise3(vec3 p) {
+    vec3 i = floor(p), f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float n000 = fxHash(i), n100 = fxHash(i + vec3(1, 0, 0));
+    float n010 = fxHash(i + vec3(0, 1, 0)), n110 = fxHash(i + vec3(1, 1, 0));
+    float n001 = fxHash(i + vec3(0, 0, 1)), n101 = fxHash(i + vec3(1, 0, 1));
+    float n011 = fxHash(i + vec3(0, 1, 1)), n111 = fxHash(i + vec3(1, 1, 1));
+    return mix(mix(mix(n000, n100, f.x), mix(n010, n110, f.x), f.y),
+               mix(mix(n001, n101, f.x), mix(n011, n111, f.x), f.y), f.z);
+}
+float fxDensityAt(vec3 p) {
+    float d = 1.0;
+    if (fogFalloff > 0.0) d = exp(-max(p.y - fogHeight, 0.0) / fogFalloff);
+    if (fogNoise > 0.0) {
+        vec3 q = p * 0.018 + vec3(time * 0.05, time * 0.012, time * 0.03);
+        float n = 0.65 * fxNoise3(q) + 0.35 * fxNoise3(q * 2.3 + 5.1);
+        d *= mix(1.0, smoothstep(0.2, 0.8, n) * 2.0, fogNoise);
+    }
+    return d;
+}
+
+vec3 viewRay(vec2 uv, float aspect) {
+    vec2 ndc = uv * 2.0 - 1.0;
+    return normalize(camFwd + camRight * (ndc.x * aspect * tanHalfFov) + camUp * (ndc.y * tanHalfFov));
+}
+
+void main() {
+    ivec3 id = ivec3(gl_GlobalInvocationID);
+    ivec3 dims = imageSize(froxOut);
+    if (any(greaterThanEqual(id, dims))) return;
+    const float aspect = fogP.w;   // render aspect (w / h)
+
+    // Jitter inside the froxel: R2 over frames, randomly rotated per froxel.
+    uint h = pcgHash(uint(id.x) * 73856093u ^ uint(id.y) * 19349663u ^ uint(id.z) * 83492791u);
+    vec3 rot = vec3(float(h & 1023u), float((h >> 10) & 1023u), float((h >> 20) & 1023u)) / 1023.0;
+    float k = float(frameIdx & 0xFFFFu);
+    vec3 j = fract(rot + k * vec3(0.8191725134, 0.6710436067, 0.5497004779));   // R3 sequence
+
+    vec2 uv = (vec2(id.xy) + j.xy) / vec2(dims.xy);
+    vec3 rd = viewRay(uv, aspect);
+    float t = froxelDepth(float(id.z) + j.z, fogP);
+    vec3 P = camPos + rd * t;
+
+    // (clear air around the eye: the fog fades in from a quarter of r.fog.start to it)
+    float dens = fogDensity * fxDensityAt(P) * smoothstep(0.25 * fogStart, fogStart, t);
+    // Behind every surface of this tile (+1 slice of margin for the trilinear read): never
+    // visible — skip the sun ray (the dominant cost).
+    bool hidden = froxelDepth(float(id.z) - 1.0, fogP) > texelFetch(tileDepth, id.xy, 0).r;
+    vec4 cur;
+    bool inWaterFx = false;
+#ifdef WATER_CLEAR
+    // Camera under water: the water it sees through is a participating medium - particles
+    // scattering the light that reaches their depth (the sun through the waves, shadowed by the
+    // terrain / trees / bodies above: light shafts, rippling with the caustics; the sky), strongly
+    // forward (HG g 0.6: shafts glow looking toward the sun). Calibrated so a deep view saturates
+    // to the old flat murk colour; grey extinction here, the colour fix-up in the shading passes.
+    bool inWater = voxelMatAt(camPos) == 5u && voxelMatAt(P) == 5u;
+    inWaterFx = inWater;
+    if (inWater) {
+        gWaterClarity = waterP.x; gWaterMurk = underP.y; gWave = waveP;
+        float ext = waterExt();
+        float surfY = underP.x > 0.0 ? camPos.y + underP.x : floor(camPos.y + waterAbove(camPos, 96));
+        float depthP = max(surfY - P.y, 0.0);
+        // The sun under water comes refracted (sunDirWater): shafts run parallel to it - to the sun
+        // seen in Snell's window - shadowed by what's under the water on the way up, then by what
+        // stands above the surface where that light came in.
+        vec3 sw = sunDirWater();
+        float L = depthP / max(sw.y, 0.05);
+        float vis = 0.0;
+        if (!hidden && sunDir.y > 0.0) {
+            bool blocked;
+            vec3 E = sunUnderwater(P, depthP, blocked);
+            vis = blocked ? 0.0 : stdLighting != 0 ? sunShadowHard(E)
+                : (occludedWorldFog(E + sunDir * 0.5, sunDir, fogShadowMax, kSkipMat) ? 0.0 : 1.0);
+            if (vis > 0.0 && numObjects > 0) {
+                Hit ob;
+                ob.hit = false;
+                traceObjectsA(E, sunDir, ob, fogShadowMax, true);
+                if (ob.hit) vis = 0.0;
+            }
+            // Volumetric caustics: the focused light streams down as beams along the refracted sun
+            // (the pattern is taken where the light came in, so it's constant along each beam).
+            if (vis > 0.0 && underP.z > 0.0)
+                vis *= max(mix(1.0, waterCausticsRGB(P, depthP, time, 0.35).g, 1.3 * min(underP.z, 1.0)), 0.0);
+        }
+        const float g = 0.7;
+        float ph = (1.0 - g * g) / pow(max(1.0 + g * g - 2.0 * g * dot(rd, sw), 1e-3), 1.5);   // 4 pi HG
+        vec3 amb = skyColor(vec3(0.0, 1.0, 0.0), 0.0) * 0.45 * giScale;
+        vec3 light = sunRGB * (kWaterSunIn * ph * vis) * waterTransLight(L) + amb * waterTransLight(depthP * 1.4);
+        cur = vec4(kWaterScatterIn * light * ext, ext);
+    } else
+#endif
+    {
+    float vis = hidden || dens < 1e-7 ? 0.0
+        : stdLighting != 0 ? sunShadowHard(P)
+        : (occludedWorldFog(P + sunDir * 0.5, sunDir, fogShadowMax, 0u) ? 0.0 : 1.0);
+    if (vis > 0.0 && numObjects > 0) {   // bodies shadow the fog too (the shadow map / world trace don't see them)
+        Hit ob;
+        ob.hit = false;
+        traceObjectsA(P, sunDir, ob, fogShadowMax, true);
+        if (ob.hit) vis = 0.0;
+    }
+    vec3 src = (fogSunRGB * (fogPhase(dot(rd, sunDir)) * vis) + fogAmbient * skyOpen(P)) * dens;   // (no sky haze in caves)
+#ifdef LIGHTS_NEE
+    if (!hidden && dens >= 1e-7 && lightCount.x > 0) {   // lamps glow in the fog
+        uint seed = pcgHash(h ^ (frameIdx * 2654435761u));
+        src += sampleLightsFog(P, dens, seed) * dens;
+    }
+#endif
+    cur = vec4(src, dens);
+    }
+
+    // Temporal: the froxel CENTRE's world point in last frame's volume.
+    vec3 rdc = viewRay((vec2(id.xy) + 0.5) / vec2(dims.xy), aspect);
+    vec3 Pc = camPos + rdc * froxelDepth(float(id.z) + 0.5, fogP);
+    vec3 dp = Pc - prevCamPos;
+    float pz = dot(dp, prevCamFwd);
+    if (pz > 0.05 && frameIdx > 0u) {
+        vec2 puv = vec2(dot(dp, prevCamRight) / (pz * prevTanHalfFov * aspect),
+                        dot(dp, prevCamUp) / (pz * prevTanHalfFov)) * 0.5 + 0.5;
+        float ps = froxelSliceOf(length(dp), fogP);
+        if (all(greaterThanEqual(puv, vec2(0.0))) && all(lessThanEqual(puv, vec2(1.0))) &&
+            ps >= 0.0 && ps <= float(dims.z)) {
+            vec4 hv = texture(froxHist, vec3(puv, ps / float(dims.z)));
+            cur = mix(cur, hv, inWaterFx ? 0.75 : kHistory);   // moving beams: less smear
+        }
+    }
+    imageStore(froxOut, id, cur);
+}

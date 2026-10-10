@@ -1,0 +1,93 @@
+// Standard lighting sun shadows, step 2: turn the exact hard shadow edge into a
+// penumbra, in screen space, deterministically (no noise, nothing to accumulate):
+//   width (voxels) = distance to the blocker x sun angular size (like the traced sun
+//   disk: contact shadows stay crisp, shadows of tall trees go soft), converted to
+//   pixels with the pixel's world footprint, capped by the quality setting.
+// Separable: pass 0 (horizontal) also estimates the width for each pixel from the
+// blockers around it (so the LIT side of an edge softens too) and stores it; pass 1
+// (vertical) reuses it. Depth- and normal-aware weights keep shadows from bleeding
+// across silhouettes.
+//   pass 0: in = shadowRaw (vis, tBlock)   out = shadowTmp (vis, radius px)
+//   pass 1: in = shadowTmp                 out = shadowRaw.r (final visibility)
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rg16f, SET(3) binding = 0) uniform writeonly image2D outImg;
+layout(SET(3) binding = 1) uniform sampler2D inTex;
+layout(SET(3) binding = 3) uniform sampler2D gbNormal;
+layout(SET(3) binding = 4) uniform sampler2D gbPos;
+
+BEGIN_PASS_UNIFORMS
+PASS_UNIFORMS_BODY
+END_PASS_UNIFORMS
+
+layout(push_constant) uniform PC { int pass_; float maxRadius; float minWidth; int pad; } pc;
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 res = imageSize(outImg);
+    if (pix.x >= res.x || pix.y >= res.y) return;
+    vec4 posT = texelFetch(gbPos, pix, 0);
+    vec2 c = texelFetch(inTex, pix, 0).rg;
+    if (posT.w < 0.0) { imageStore(outImg, pix, vec4(c.r, 0.0, 0.0, 0.0)); return; }
+    vec3 N = texelFetch(gbNormal, pix, 0).xyz * 2.0 - 1.0;
+    float fp = posT.w * 2.0 * tanHalfFov / float(res.y);        // voxels per pixel here
+    float radius;
+    if (pc.pass_ == 0) {
+        // Penumbra width from the blockers of this pixel and its neighbours (a lit
+        // pixel next to a shadow takes that shadow's blocker distance).
+        // Lit pixels search 8 directions out to the full max radius (a shorter search
+        // left a hard ring where the shadow side's blur reached further than it).
+        float tb = c.g, n = c.g > 0.0 ? 1.0 : 0.0;
+        const vec2 dirs[8] = vec2[](vec2(1, 0), vec2(-1, 0), vec2(0, 1), vec2(0, -1),
+                                    vec2(0.7071, 0.7071), vec2(-0.7071, 0.7071),
+                                    vec2(0.7071, -0.7071), vec2(-0.7071, -0.7071));
+        if (n == 0.0) {
+            for (int k = 1; k <= 3; k++) {
+                float dist = max(2.0, pc.maxRadius * float(k) / 3.0);
+                for (int i = 0; i < 8; i++) {
+                    ivec2 q = clamp(pix + ivec2(round(dirs[i] * dist)), ivec2(0), res - 1);
+                    vec2 qv = texelFetch(inTex, q, 0).rg;
+                    if (qv.g > 0.0) { tb += qv.g; n += 1.0; }
+                }
+            }
+            tb = n > 0.0 ? tb / n : 0.0;
+        }
+        float widthV = tb * sunAngle + pc.minWidth;             // penumbra half-width, voxels
+        radius = n > 0.0 ? clamp(widthV / max(fp, 1e-4), 0.0, pc.maxRadius) : 0.0;
+    } else {
+        radius = c.g;
+    }
+    float v = c.r;
+    if (radius >= 0.5) {
+        ivec2 dir = pc.pass_ == 0 ? ivec2(1, 0) : ivec2(0, 1);
+        float sigma = radius * 0.5;
+        float sum = v, wsum = 1.0;
+        float step_ = max(1.0, radius / 6.0);                   // <= 13 taps per direction
+        for (float o = step_; o <= radius + 0.01; o += step_) {
+            for (int s = -1; s <= 1; s += 2) {
+                // Fractional tap: visibility lerped between the two covering texels (a
+                // rounded strided tap made the penumbra a staircase of step_-px bands);
+                // geometry weights from the nearer texel.
+                float fo = o * float(s);
+                ivec2 q0 = clamp(pix + dir * int(floor(fo)), ivec2(0), res - 1);
+                ivec2 q1 = clamp(pix + dir * int(floor(fo) + 1.0), ivec2(0), res - 1);
+                float fr = fract(fo);
+                ivec2 q = fr < 0.5 ? q0 : q1;
+                vec4 qp = texelFetch(gbPos, q, 0);
+                if (qp.w < 0.0) continue;
+                vec3 qn = texelFetch(gbNormal, q, 0).xyz * 2.0 - 1.0;
+                // Plane distance, not ray-length difference: neighbours on the same floor
+                // seen at a grazing angle differ a lot in t but not in plane distance.
+                float wz = exp(-abs(dot(qp.xyz - posT.xyz, N)) / (0.02 * posT.w + 0.5));
+                float wn = pow(max(dot(qn, N), 0.0), 8.0);
+                float w = exp(-o * o / (2.0 * sigma * sigma)) * wz * wn;
+                float qv = mix(texelFetch(inTex, q0, 0).r, texelFetch(inTex, q1, 0).r, fr);
+                sum += qv * w;
+                wsum += w;
+            }
+        }
+        v = sum / wsum;
+    }
+    imageStore(outImg, pix, vec4(v, radius, 0.0, 0.0));
+}

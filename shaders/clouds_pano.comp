@@ -1,0 +1,21 @@
+// The clouds as seen from the eye over the whole upper hemisphere, into a small panorama (256 x 128: azimuth across,
+// elevation 0 .. 90 deg down) - what the water reflects (common.glsl skyWithClouds). Run before the water each frame
+// (LitRenderer::recordWater) when there are clouds. (rgb: in-scattered light, a: transmittance - as cloudMarch.)
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rgba16f, SET(3) binding = 0) uniform writeonly image2D cloudPano;
+
+BEGIN_PASS_UNIFORMS
+PASS_UNIFORMS_BODY
+END_PASS_UNIFORMS
+
+void main() {
+    ivec2 o = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 n = imageSize(cloudPano);
+    if (o.x >= n.x || o.y >= n.y) return;
+    float az = ((float(o.x) + 0.5) / float(n.x) - 0.5) * 6.2831853;
+    float el = (float(o.y) + 0.5) / float(n.y) * 1.5707963;
+    vec3 d = vec3(cos(el) * cos(az), sin(el), cos(el) * sin(az));
+    imageStore(cloudPano, o, cloudMarch(camPos, d, 1e9, 0.5));
+}

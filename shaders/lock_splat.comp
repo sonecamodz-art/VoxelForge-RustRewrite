@@ -1,0 +1,62 @@
+// Locked view (L), mode 1: re-project the LOCKED camera's G-buffer snapshot into
+// the GHOST camera, so the ghost view shows only what the locked view renders
+// (gbuffer.comp then takes its surfaces from here instead of tracing, and the
+// normal lighting chain shades them live). One thread per locked pixel; each
+// splats a small square (sized by how much closer the ghost is) so surfaces stay
+// closed. Two dispatches, told apart by the dispatch depth:
+//   z = 1: nearest ghost-space distance per ghost pixel (atomicMin on float bits)
+//   z = 2: the winner (depth == min) writes its locked pixel index.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(r32ui, SET(3) binding = 0) uniform uimage2D lockDepth;   // ghost res
+layout(r32ui, SET(3) binding = 1) uniform uimage2D lockIdx;     // ghost res
+layout(SET(3) binding = 2) uniform sampler2D lockPos;           // locked snapshot
+layout(SET(3) binding = 3) uniform sampler2D lockNormal;
+layout(std140, SET(3) binding = 14) uniform LockParams {
+    vec3 lkPos;   float lkTanHalfFov;
+    vec3 lkRight; float lkAspect;
+    vec3 lkUp;    float lkGrassDist;
+    vec3 lkFwd;   float lkResY;
+    int lkMode, lkOutW, lkOutH, lkValid;
+};
+
+BEGIN_PASS_UNIFORMS
+PASS_UNIFORMS_BODY
+END_PASS_UNIFORMS
+
+void main() {
+    bool indexPass = gl_NumWorkGroups.z > 1u;
+    if (indexPass && gl_WorkGroupID.z == 0u) return;
+    ivec2 lp = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 lres = textureSize(lockPos, 0);
+    if (lp.x >= lres.x || lp.y >= lres.y) return;
+    vec4 L = texelFetch(lockPos, lp, 0);
+    if (L.w < 0.0) return;                                  // locked view saw sky
+    ivec2 res = imageSize(lockDepth);
+    vec3 v = L.xyz - camPos;
+    float z = dot(v, camFwd);
+    if (z < 0.05) return;                                   // behind the ghost
+    float aspect = float(res.x) / float(res.y);
+    vec2 ndc = vec2(dot(v, camRight) / (z * tanHalfFov * aspect), dot(v, camUp) / (z * tanHalfFov));
+    vec2 sp = (ndc * 0.5 + 0.5) * vec2(res);                // ghost pixel coords
+    float d = length(v);
+    // Footprint: a locked pixel covers L.w * k / |N.vLock| voxels of the surface
+    // (stretched at grazing angles); seen from the ghost that patch spans
+    // (L.w / d) * |N.vGhost| / |N.vLock| ghost pixels.
+    vec3 N = texelFetch(lockNormal, lp, 0).xyz * 2.0 - 1.0;
+    float cl = max(abs(dot(N, normalize(L.xyz - lkPos))), 0.2);
+    float cg = abs(dot(N, v / max(d, 1e-3)));
+    float span = 1.25 * L.w / max(d, 1e-3) * float(res.y) / float(lres.y) * max(cg / cl, 0.35);
+    int n = clamp(int(ceil(span)), 1, 8);
+    ivec2 p0 = ivec2(floor(sp - 0.5 * float(n - 1)));
+    uint key = floatBitsToUint(d);
+    uint idx = uint(lp.y * lres.x + lp.x);
+    for (int j = 0; j < n; j++)
+        for (int i = 0; i < n; i++) {
+            ivec2 q = p0 + ivec2(i, j);
+            if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, res))) continue;
+            if (!indexPass) imageAtomicMin(lockDepth, q, key);
+            else if (imageLoad(lockDepth, q).r == key) imageStore(lockIdx, q, uvec4(idx));
+        }
+}

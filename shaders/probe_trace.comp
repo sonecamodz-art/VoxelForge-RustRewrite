@@ -1,0 +1,78 @@
+// Standard lighting: trace kProbeRays rays for each probe updated this frame
+// (probeUpdateOffset .. +2048). Hit radiance = albedo x (shadow-mapped sun +
+// emissive + the probes' own irradiance there -> multi-bounce); miss = sky.
+// Writes (radiance, distance) per ray; probe_update.comp blends them in.
+// One workgroup per probe, one thread per ray.
+
+layout(local_size_x = 64) in;
+
+layout(rgba16f, SET(3) binding = 0) uniform writeonly image2D probeRays;   // 64 x 2048
+
+// This frame's probe update list (LitRenderer: new cells first, then round robin).
+layout(std140, SET(3) binding = 5) uniform ProbeList { uvec4 probeList[1280]; };
+
+BEGIN_PASS_UNIFORMS
+PASS_UNIFORMS_BODY
+END_PASS_UNIFORMS
+
+const float kProbeReach = 256.0;
+
+void main() {
+    int ray = int(gl_LocalInvocationID.x);
+    int row = int(gl_WorkGroupID.x);
+    int L; ivec3 slot, cell;
+    probeFromEntry(probeList[row >> 2][row & 3], L, slot, cell);
+    ivec2 sc = probeStateCoord(probeIndex(L, slot));
+    vec4 pd = texelFetch(probeDataTex, sc, 0);
+    bool fresh = texelFetch(probeStateTex, sc, 0).r != probeKey(L, cell) ||
+                 probeResettle(probeList[row >> 2][row & 3]);
+    vec3 pos = probeCentre(L, cell) + (fresh ? vec3(0.0) : pd.xyz);   // relocated position
+    if (voxelSolidAt(pos)) {                 // buried probe: mark, update relocates it
+        imageStore(probeRays, ivec2(ray, row), vec4(0.0, 0.0, 0.0, -1.0));
+        return;
+    }
+#ifdef GI_OBJECTS
+    {   // inside a body passing through: skip this update (keep the probe's light)
+        int b0, b1;
+        nearBodies(pos, 0.0, b0, b1);
+        if (objectSolidAt(b0, pos) || objectSolidAt(b1, pos)) {
+            imageStore(probeRays, ivec2(ray, row), vec4(0.0, 0.0, 0.0, -2.0));
+            return;
+        }
+    }
+#endif
+    vec3 dir = probeRayDir(ray, frameIdx);
+    const float reach = L == 0 ? kProbeReach : 2.0 * kProbeReach;
+    Hit h = traceWorldProbe(pos, dir, reach, kSkipMat);
+    GI_ADD_OBJECTS(pos, dir, h, reach);
+    vec3 rad;
+    float dist;
+    if (!h.hit) {
+        rad = min(skyColor(dir, 0.0), vec3(3.0)) * escapedSky(pos + dir * reach);   // no sun disk: direct sun is added at hits
+        dist = reach;
+    } else {
+        dist = h.t;
+        vec3 hp = pos + dir * h.t;
+        Material m = materials[h.mat];
+        vec3 alb = m.albedoEmissive.rgb;
+        float ndl = max(dot(h.normal, sunDir), 0.0);
+        float sun = ndl > 0.0 ? sunShadowHard(hp + h.normal * 0.1) : 0.0;
+#ifdef GI_OBJECTS
+        if (sun > 0.0 && numObjects > 0) {   // the shadow map holds the world only
+            Hit ob;
+            ob.hit = false;
+            traceObjectsA(hp + h.normal * 0.1, sunDir, ob, 1e30, true);
+            if (ob.hit) sun = 0.0;
+        }
+#endif
+        float emit = m.albedoEmissive.a * 8.0;
+#ifdef LIGHTS_NEE
+        // Listed emitters light the surfaces directly (lightsDirect in shade_std): a few
+        // random probe rays hitting / missing a small lamp made its light flicker.
+        if (m.albedoEmissive.a >= 0.5) emit = 0.0;
+#endif
+        rad = alb * (sunRGB * (ndl * sun) + emit)
+            + min(alb, vec3(0.6)) * probeIrradiance(hp + h.normal * 0.1, h.normal, -dir) * giScale * 0.9;
+    }
+    imageStore(probeRays, ivec2(ray, row), vec4(rad, dist));
+}

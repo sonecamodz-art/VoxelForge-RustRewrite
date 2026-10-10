@@ -1,0 +1,196 @@
+// Transparent water, part 2 (r.water 1): everything a water pixel shows ON TOP of the
+// refracted bed (which the normal lighting chain shades, see gbuffer.comp):
+//   - REFLECTION: one mirror ray off the wave normal, traced through the scene (terrain,
+//     trees, bodies; water skipped) and shaded cheaply at the hit: its own sun ray +
+//     sky ambient x contact AO. Sky if it escapes. Weighted by Fresnel.
+//   - SUN GLINT: the sky's sun disk in the mirror direction x Fresnel, gated by a sun ray.
+//   - IN-SCATTER: light scattered back by the water body along the view path, so deep
+//     water turns blue-green instead of black (weighted by 1 - transmittance).
+// Deterministic (no random numbers) -> nothing to denoise. waterAdd = (radiance, -).
+// Camera under water: only the in-scatter (murk) along the view ray.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rgba16f, SET(3) binding = 0) uniform writeonly image2D waterAdd;
+layout(SET(3) binding = 1) uniform sampler2D gbWater;
+layout(SET(3) binding = 4) uniform sampler2D gbPos;
+layout(SET(3) binding = 2) uniform sampler2D reflHalf;   // water_refl_half.comp: (reflection, its surface distance)
+// Glossy surfaces (r.reflect): their reflection goes into waterAdd too (a pixel is never both), weighted by the
+// specular lobe's traced share (common.glsl glossyShare) - shadeSurface leaves that share out of its own.
+layout(SET(3) binding = 3) uniform sampler2D gbNormal;
+layout(SET(3) binding = 5) uniform sampler2D gbSurf;
+layout(SET(3) binding = 6) uniform sampler2D gbAlbedo;
+
+BEGIN_PASS_UNIFORMS
+PASS_UNIFORMS_BODY
+END_PASS_UNIFORMS
+
+#if !defined(WATER_CLEAR) && !defined(REFL_GLOSSY)
+void main() {}   // never dispatched (still compiled with every pass)
+#else
+#ifdef REFL_GLOSSY
+// A glossy surface's reflection. REFL_STOCHASTIC (RR, ground truth): one direction sampled from the GGX
+// distribution of visible normals (Heitz 2018), new every frame - RR denoises it like the rest of the colour.
+// Otherwise one mirror ray (glossyShare keeps that to near-mirrors).
+vec3 sampleGGXVNDF(vec3 Ve, float a, vec2 u) {   // Ve: the view direction in tangent space (z = normal)
+    vec3 Vh = normalize(vec3(a * Ve.x, a * Ve.y, Ve.z));
+    float lensq = Vh.x * Vh.x + Vh.y * Vh.y;
+    vec3 T1 = lensq > 0.0 ? vec3(-Vh.y, Vh.x, 0.0) * inversesqrt(lensq) : vec3(1.0, 0.0, 0.0);
+    vec3 T2 = cross(Vh, T1);
+    float r = sqrt(u.x), phi = 6.2831853 * u.y;
+    float t1 = r * cos(phi), t2 = r * sin(phi);
+    float sh = 0.5 * (1.0 + Vh.z);
+    t2 = (1.0 - sh) * sqrt(max(1.0 - t1 * t1, 0.0)) + sh * t2;
+    vec3 Nh = t1 * T1 + t2 * T2 + sqrt(max(1.0 - t1 * t1 - t2 * t2, 0.0)) * Vh;
+    return normalize(vec3(a * Nh.x, a * Nh.y, max(Nh.z, 0.0)));
+}
+vec3 glossyReflection(ivec2 pix, vec3 P, vec3 N, vec3 rd, float rough, bool useMap) {
+    vec3 R = reflect(rd, N);
+#ifdef REFL_STOCHASTIC
+    vec3 T = normalize(cross(abs(N.y) < 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0), N));
+    vec3 B = cross(N, T);
+    vec3 V = -rd;
+    uint seed = pixelSeed(pix, frameIdx, 11u);
+    vec3 Ht = sampleGGXVNDF(vec3(dot(V, T), dot(V, B), dot(V, N)), max(rough * rough, 0.002), vec2(rnd(seed), rnd(seed)));
+    vec3 L = reflect(rd, normalize(T * Ht.x + B * Ht.y + N * Ht.z));
+    if (dot(L, N) > 0.02) R = L;
+#endif
+    return reflRadianceDir(P + N * 0.05, R, useMap, max(waterP.w, 400.0), time, false);
+}
+#endif
+// The half-res reflection at this pixel: the 2x2 blocks around it, weighted bilinearly and by how
+// close their surface distance is to this pixel's (no bleeding across the shore / a near rock);
+// r < 0 = no block matches (the caller traces it itself).
+vec3 reflUpsample(ivec2 pix, float tS) {
+    ivec2 hres = textureSize(reflHalf, 0);
+    vec2 f = (vec2(pix) + 0.5) * 0.5 - 0.5;
+    ivec2 b = ivec2(floor(f));
+    vec2 w = f - vec2(b);
+    vec3 sum = vec3(0.0);
+    float ws = 0.0;
+    for (int k = 0; k < 4; k++) {
+        ivec2 o = ivec2(k & 1, k >> 1);
+        ivec2 q = clamp(b + o, ivec2(0), hres - 1);
+        vec4 v = texelFetch(reflHalf, q, 0);
+        if (v.a <= 0.0) continue;
+        float wb = (o.x == 1 ? w.x : 1.0 - w.x) * (o.y == 1 ? w.y : 1.0 - w.y) + 1e-3;
+        float wd = exp(-abs(v.a - tS) / max(0.02 * tS, 0.25));
+        sum += v.rgb * wb * wd;
+        ws += wb * wd;
+    }
+    return ws > 1e-3 ? sum / ws : vec3(-1.0);
+}
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 res = imageSize(waterAdd);
+    if (pix.x >= res.x || pix.y >= res.y) return;
+    vec2 sampleC = vec2(pix) + 0.5 + jitter;   // same ray as gbuffer.comp
+    vec2 ndc = sampleC / vec2(res) * 2.0 - 1.0;
+    float aspect = float(res.x) / float(res.y);
+    vec3 rd = normalize(camFwd + camRight * (ndc.x * aspect * tanHalfFov) +
+                        camUp * (ndc.y * tanHalfFov));
+    bool useMap = stdLighting != 0 && optP.x > 0.0;   // Standard: the sun from the cached shadow map
+#ifdef WATER_CLEAR
+    vec4 wv = texelFetch(gbWater, pix, 0);
+#else
+    vec4 wv = vec4(0.0);
+#endif
+    if (wv.x <= 0.0) {
+#ifdef REFL_GLOSSY
+        vec4 posT = texelFetch(gbPos, pix, 0);
+        vec4 sf = texelFetch(gbSurf, pix, 0);
+        float gs = posT.w < 0.0 ? 0.0 : glossyShare(sf.r);
+        if (gs > 0.0) {
+            vec3 N = normalize(texelFetch(gbNormal, pix, 0).xyz * 2.0 - 1.0);
+            vec3 base = texelFetch(gbAlbedo, pix, 0).rgb;
+            vec3 spec = envBRDF(surfaceF0(base, sf.g), max(dot(N, -rd), 1e-3), sf.r);
+            vec3 refl = glossyReflection(pix, posT.xyz, N, rd, sf.r, useMap);
+            imageStore(waterAdd, pix, vec4(spec * gs * refl, 0.0));
+            return;
+        }
+#endif
+        imageStore(waterAdd, pix, vec4(0.0));
+        return;
+    }
+#ifdef WATER_CLEAR
+    gWaterClarity = waterP.x; gWaterMurk = underP.y; gWave = waveP;
+    float tS = texelFetch(gbPos, pix, 0).w;
+    vec3 T = waterTrans(wv.x);
+    vec3 amb = skyAmbient(vec3(0.0, 1.0, 0.0));
+
+    bool underwater = wv.y < 0.0;   // gbuffer.comp: camera under water
+    if (underwater) {
+        // The water around the camera is lit by what reaches its depth (darker further down).
+        // With the froxel fog the water's in-scatter (with the sun's shafts through it) is in the
+        // fog volume along the straight view ray (wv.z of it); only a path the froxels don't
+        // follow - reflected back down off the surface from below - gets it here, flat.
+        float dCam = underP.x > 0.0 ? underP.x : waterAbove(camPos, 96);
+        vec3 light = amb * waterTransLight(dCam * 1.4) +
+                     sunRGB * max(sunDir.y, 0.0) * kWaterSunIn * waterTransLight(dCam / max(sunDirWater().y, 0.1));
+#ifdef FOG_FROXEL
+        vec3 seg = max(waterTrans(wv.z) - T, vec3(0.0));
+#else
+        vec3 seg = 1.0 - T;
+#endif
+        imageStore(waterAdd, pix, vec4(kWaterScatterIn * light * seg, 0.0));
+        return;
+    }
+
+    vec3 Ps = camPos + rd * tS;
+    vec3 Nw = vec3(wv.z, sqrt(max(1.0 - wv.z * wv.z - wv.w * wv.w, 0.0)), wv.w);
+    vec3 V = -rd;
+    float F = waterFresnel(Nw, V);
+    vec3 origin = Ps + Nw * 0.05;
+    // Standard lighting: the sun's visibility from the cached shadow map (the reflection's detail
+    // doesn't need exact rays; saves two of the three rays per water pixel). Else a ray.
+    float sunVis = sunDir.y <= 0.0 ? 0.0 : useMap ? sunShadowHard(origin) : (!occludedShadow(origin, sunDir, 1e30, kSkipMat) ? 1.0 : 0.0);
+
+    vec3 refl;
+    if (waterP.w > 0.0) {
+        if (optP.w > 0.0) {   // r.water.reflect.half: traced once per 2x2 block (water_refl_half.comp)
+            refl = reflUpsample(pix, tS);
+            if (refl.r < 0.0) refl = reflRadiance(origin, rd, Nw, useMap, waterP.w, time);
+        } else {
+            refl = reflRadiance(origin, rd, Nw, useMap, waterP.w, time);
+        }
+    } else {
+        refl = skyColor(reflect(rd, Nw), 0.0);
+    }
+    // Sun glint = the sky's own sun disk seen in the mirror direction, x Fresnel: the
+    // same lobe and brightness as the sun in the sky (the old wide pow(N.H, 220) x 3 x sun
+    // with no Fresnel made every wave toward the sun ~3x the sun -> a white bloom streak).
+    // Clamped so a single facet can't dominate bloom / the resolve.
+    vec3 Rg = reflect(rd, Nw);
+    vec3 glint = min(F * sunVis * (skyColor(Rg, 1.0) - skyColor(Rg, 0.0)), vec3(6.0));
+    vec3 scatter = kWaterScatter * (amb + sunRGB * max(sunDir.y, 0.0) * sunVis * 0.3) * (1.0 - T) * (1.0 - F);
+#ifdef LIGHTS_NEE
+    // Lamps: light scattered in the water under them, and their glint on the waves where
+    // the mirror ray above can't see them (reflections off, or beyond their reach) — a
+    // lamp's box seen in the mirror direction at its own radiance, x Fresnel.
+    {
+        vec3 lampScatter = vec3(0.0), lampGlint = vec3(0.0);
+        for (int i = 0; i < lightCount.x; i++) {
+            vec3 L = lightA[i].xyz - origin;
+            float d2 = dot(L, L), r = lightA[i].w;
+            float d = sqrt(d2);
+            vec3 Ld = L / max(d, 1e-4);
+            vec3 pw = lightB[i].rgb;
+            vec3 iso = pw / (4.0 * 3.14159265 * max(d2, r * r));
+            float a = max(r / max(d, 1e-4), 0.015);   // angular radius (+ wave blur)
+            float g = (waterP.w > 0.0 && d < waterP.w) ? 0.0
+                    : smoothstep(cos(min(a * 1.4, 1.5)), cos(a * 0.7), dot(Rg, Ld));
+            if (iso.r + iso.g + iso.b < kLightMin * 10.0 && g <= 0.0) continue;   // far lamps: invisible, a ray each
+            float vis = lightC[i].w >= 0.0 ? lampCacheVis(i, Ps, Nw)   // Standard: the lamp shadow cache
+                                           : (lightVisible(i, origin, Ld, d) ? 1.0 : 0.0);
+            if (vis <= 0.0) continue;
+            lampScatter += iso * vis;
+            lampGlint += g * vis * pw / (3.14159265 * r * r);   // the emitter's radiance
+        }
+        glint += min(F * lampGlint, vec3(6.0));
+        scatter += kWaterScatter * lampScatter * (1.0 - T) * (1.0 - F);
+    }
+#endif
+    imageStore(waterAdd, pix, vec4(F * refl + glint + scatter, 0.0));
+#endif
+}
+#endif

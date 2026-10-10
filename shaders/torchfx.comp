@@ -1,0 +1,36 @@
+// Torch flames + embers (torchfx.glsl) and the rain (rain.glsl: streaks, splashes) added into an HDR image right before its exposure / bloom / tonemap (PostFx):
+// DLSS-RR's / DLAA's output at display resolution, or the raw / Standard colour at render resolution. Depth from the
+// G-buffer (render resolution, scaled). Runs only with torches in the list or rain falling.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rgba16f, SET(3) binding = 0) uniform image2D hdr;
+layout(SET(3) binding = 3) uniform sampler2D gbNormal;
+layout(SET(3) binding = 4) uniform sampler2D gbPos;
+
+BEGIN_PASS_UNIFORMS
+PASS_UNIFORMS_BODY
+END_PASS_UNIFORMS
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 res = imageSize(hdr);
+    if (pix.x >= res.x || pix.y >= res.y) return;
+    vec2 ndc = (vec2(pix) + 0.5) / vec2(res) * 2.0 - 1.0;
+    float aspect = float(res.x) / float(res.y);
+    vec3 rd = normalize(camFwd + camRight * (ndc.x * aspect * tanHalfFov) + camUp * (ndc.y * tanHalfFov));
+    ivec2 gres = textureSize(gbPos, 0);
+    ivec2 gp = min(pix * gres / res, gres - 1);
+    float tS = texelFetch(gbPos, gp, 0).w;
+    vec3 add = torchFlames(camPos, rd, tS < 0.0 ? 1e30 : tS, time);
+    bool rain = rainA.x > 0.001;
+    if (!rain && max(add.r, max(add.g, add.b)) <= 0.0) return;
+    vec4 c = imageLoad(hdr, pix);
+    vec3 col = c.rgb + add;
+    if (rain) {
+        float pixAng = 2.0 * tanHalfFov / float(res.y);
+        if (tS >= 0.0) col = rainSplashes(col, camPos + rd * tS, texelFetch(gbNormal, gp, 0).xyz * 2.0 - 1.0, tS, pixAng);
+        col = rainDrops(col, camPos, rd, tS, pixAng, waveP);
+    }
+    imageStore(hdr, pix, vec4(col, c.a));
+}

@@ -1,0 +1,43 @@
+// Auto exposure (eye adaptation) for PostFx. Standalone. One workgroup: 256
+// threads x 4 samples spread over the HDR image (centre-weighted), geometric mean
+// luminance -> target factor key / avgLum (partial adaptation, so caves stay
+// darker than daylight and bright skies don't wash out), eased toward over time.
+// state.r = current factor (multiplies the manual exposure), state.g = avg lum.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0) uniform sampler2D hdrIn;
+layout(set = 0, binding = 1, rg32f) uniform image2D state;
+layout(push_constant) uniform PC { float dt; float speed; float key; int reset; float minF; float maxF; float pad0; float pad1; } pc;
+
+shared float sLum[256];
+shared float sW[256];
+
+void main() {
+    uint t = gl_LocalInvocationIndex;
+    float acc = 0.0, wacc = 0.0;
+    for (int k = 0; k < 4; k++) {
+        vec2 cell = vec2(gl_LocalInvocationID.xy) + vec2(k & 1, k >> 1) * 0.5 + 0.25;
+        vec2 uv = cell / 16.0;
+        vec3 c = textureLod(hdrIn, uv, 0.0).rgb;
+        float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+        if (!(l >= 0.0)) l = 0.0;   // NaN (max(NaN, x) is undefined) must not poison the average
+        float w = 1.0 - 0.6 * length(uv - 0.5);        // centre-weighted
+        acc += log(max(l, 1e-4)) * w;
+        wacc += w;
+    }
+    sLum[t] = acc; sW[t] = wacc;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (t < s) { sLum[t] += sLum[t + s]; sW[t] += sW[t + s]; }
+        barrier();
+    }
+    if (t == 0u) {
+        float avg = exp(sLum[0] / sW[0]);
+        float target = clamp(pow(pc.key / max(avg, 1e-4), 0.7), pc.minF, pc.maxF);   // (r.autoexposure.min / max)
+        float cur = imageLoad(state, ivec2(0)).r;
+        if (pc.reset != 0 || !(cur > 0.0)) cur = target;
+        cur += (target - cur) * (1.0 - exp(-pc.dt * pc.speed));
+        imageStore(state, ivec2(0), vec4(cur, avg, 0, 0));
+    }
+}
