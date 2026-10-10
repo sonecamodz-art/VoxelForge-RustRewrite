@@ -2155,6 +2155,8 @@ dependencies = [
  "ash",
  "ash-window",
  "bytemuck",
+ "cc",
+ "cmake",
  "egui",
  "egui-ash-renderer",
  "egui-winit",
