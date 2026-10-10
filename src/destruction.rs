@@ -2,10 +2,9 @@
 //! (a cut tree takes its own crown and tips over toward the cut); loose foliage falls, tiny
 //! pieces vanish. Bodies split when a carve cuts them in two.
 
-use std::collections::HashMap;
-use std::hash::{BuildHasherDefault, Hasher};
 use std::time::Instant;
 
+use crate::hash::VoxMap;
 use crate::math::{Mat3, Vec3};
 use crate::objects::VoxObject;
 use crate::voxel::world::{wm, World};
@@ -36,35 +35,6 @@ struct Cell {
 const fn cell(x: i32, y: i32, z: i32) -> Cell {
     Cell { x, y, z }
 }
-
-/// Hashing for the voxel-key maps: one 64-bit finalizer (murmur3 fmix64) per key. SipHash is
-/// several times slower on the millions of lookups a big felling does, and the keys are not
-/// attacker-controlled. (A plain multiply would leave the bucket bits blind to x, which sits in
-/// the key's high bits.)
-#[derive(Default)]
-struct VoxHasher(u64);
-
-impl Hasher for VoxHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-    fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.write_u64(self.0 ^ b as u64);
-        }
-    }
-    fn write_u64(&mut self, v: u64) {
-        let mut k = v;
-        k ^= k >> 33;
-        k = k.wrapping_mul(0xff51_afd7_ed55_8ccd);
-        k ^= k >> 33;
-        k = k.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
-        k ^= k >> 33;
-        self.0 = k;
-    }
-}
-
-type FxMap<V> = HashMap<u64, V, BuildHasherDefault<VoxHasher>>;
 
 /// A voxel's key (absolute coordinates; endless worlds are unbounded in x / z).
 #[inline]
@@ -200,7 +170,7 @@ struct Detach<'a> {
     center: Vec3,
     r: f32,
     before_remove: Option<DetachRegionFn<'a>>,
-    mark: FxMap<u8>,
+    mark: VoxMap<u8>,
     comp: Vec<Cell>,
     stack: Vec<Cell>,
     spawned: usize,
@@ -527,7 +497,7 @@ impl Detach<'_> {
         // OUT_HELD - reached by a held group, so held too (same component): a later group
         // touching it holds at once instead of re-flooding the neighbour's crown.
         const OUT_HELD: u32 = u32::MAX;
-        let mut out_seen: FxMap<u32> = FxMap::default();
+        let mut out_seen: VoxMap<u32> = VoxMap::default();
         let mut generation = 0u32;
         let (mut group, mut outside, mut gstack) = (Vec::new(), Vec::new(), Vec::new());
         for &c0 in &rest {
@@ -927,7 +897,7 @@ pub fn world_carve_detach<'a>(world: &'a mut World, center: Vec3, r: f32, object
         center,
         r,
         before_remove,
-        mark: FxMap::with_capacity_and_hasher(1 << 16, Default::default()),
+        mark: VoxMap::with_capacity_and_hasher(1 << 16, Default::default()),
         comp: Vec::new(),
         stack: Vec::new(),
         spawned: 0,

@@ -26,6 +26,7 @@ use crate::gfx::renderer::record::Rec;
 use crate::gfx::renderer::Renderer;
 use crate::math::Vec3;
 use crate::objects::{build_self_test_objects, VoxObject};
+use crate::fluid::FluidSim;
 use crate::physics::{self, BodyState, Physics};
 use crate::player::{self as pl, Player, PlayerInput, PlayerTuning, PlayerWorld};
 use crate::voxel::world::{wm, World};
@@ -66,6 +67,11 @@ struct Game {
     /// Body states at the previous physics step (render interpolation).
     phys_prev: Vec<BodyState>,
     phys_was_on: bool,
+    /// The world's water; its voxel changes reach the GPU at most every 100 ms (a sync
+    /// re-uploads the touched bricks and rebuilds their distance field).
+    fluid: FluidSim,
+    fluid_dirty: bool,
+    fluid_synced: Instant,
 }
 
 enum Phase {
@@ -479,13 +485,33 @@ impl Running {
         match button {
             MouseButton::Left => {
                 g.world.fill_sphere(c.x, c.y, c.z, rad, wm::AIR);
+                // Water next to the edit flows into the hole.
+                let (lo, hi) = (c - (rad + 1.0), c + (rad + 1.0));
+                g.fluid.wake(lo.x as i32, lo.y as i32, lo.z as i32, hi.x as i32, hi.y as i32, hi.z as i32);
                 // Pieces cut loose fall as bodies (a cut tree topples).
                 spawned = crate::destruction::world_carve_detach(&mut g.world, c, rad, &mut g.objects, None);
             }
             MouseButton::Right => {
                 let n = Vec3::new(h.normal[0] as f32, h.normal[1] as f32, h.normal[2] as f32);
                 let p = c + n * rad;
+                if g.place_mat != wm::WATER {
+                    // Water the ball fills moves out of its way (up and around it).
+                    let r2 = rad * rad;
+                    let (lo, hi) = ((p - rad).floor(), (p + rad).ceil());
+                    for z in lo.z as i32..=hi.z as i32 {
+                        for y in lo.y as i32..=hi.y as i32 {
+                            for x in lo.x as i32..=hi.x as i32 {
+                                let d = Vec3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5) - p;
+                                if d.length_squared() <= r2 && g.fluid.volume(&g.world, x, y, z) > 0.0 {
+                                    g.fluid.displace(&mut g.world, x, y, z);
+                                }
+                            }
+                        }
+                    }
+                }
                 g.world.fill_sphere(p.x, p.y, p.z, rad, g.place_mat);
+                let (lo, hi) = (p - (rad + 1.0), p + (rad + 1.0));
+                g.fluid.wake(lo.x as i32, lo.y as i32, lo.z as i32, hi.x as i32, hi.y as i32, hi.z as i32);
             }
             _ => return,
         }
@@ -560,6 +586,9 @@ impl Running {
                     phys_acc: 0.0,
                     phys_prev: Vec::new(),
                     phys_was_on: false,
+                    fluid: FluidSim::default(),
+                    fluid_dirty: false,
+                    fluid_synced: now,
                 }));
                 self.window.set_title("VoxelForge - click to look around, Esc to free the mouse");
             } else {
@@ -591,6 +620,14 @@ impl Running {
         g.frame_ms += (dt * 1e3 - g.frame_ms) * 0.1;
         g.cam.move_speed = cvars::IN_FLYSPEED.get();
         g.simulate(&self.ctx, dt);
+        if !cvars::R_TIME_FREEZE.get() && g.fluid.update(&mut g.world, dt) {
+            g.fluid_dirty = true;
+        }
+        if g.fluid_dirty && g.fluid_synced.elapsed().as_secs_f32() >= 0.1 {
+            g.r.gpu.sync(&self.ctx, &mut g.world);
+            g.fluid_dirty = false;
+            g.fluid_synced = Instant::now();
+        }
         if cvars::IN_WALK.get() {
             g.walk(dt);
         } else {

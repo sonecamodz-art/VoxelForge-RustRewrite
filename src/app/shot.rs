@@ -111,18 +111,39 @@ pub fn run_shot(a: &ShotArgs) -> i32 {
         // VF_CARVE_CAM (same format as VF_CAM) aims the carve from elsewhere than the view.
         let mut aim = cam;
         apply_cam_env(&mut aim, "VF_CARVE_CAM");
+        // VF_CARVE_AT="x,y,z" carves exactly there instead (a ray from the air stops at water).
+        let at: Vec<f32> = std::env::var("VF_CARVE_AT").unwrap_or_default().split(',').filter_map(|t| t.trim().parse().ok()).collect();
         let h = world.raycast(aim.pos, aim.forward(), 600.0, 0);
-        if h.hit {
-            let c = crate::math::Vec3::new(h.cell[0] as f32 + 0.5, h.cell[1] as f32 + 0.5, h.cell[2] as f32 + 0.5);
+        let target = if at.len() == 3 {
+            Some(crate::math::Vec3::new(at[0], at[1], at[2]))
+        } else {
+            h.hit.then(|| crate::math::Vec3::new(h.cell[0] as f32 + 0.5, h.cell[1] as f32 + 0.5, h.cell[2] as f32 + 0.5))
+        };
+        if let Some(c) = target {
             world.fill_sphere(c.x, c.y, c.z, rad, 0);
             let spawned = crate::destruction::world_carve_detach(&mut world, c, rad, &mut objects, None);
+            // VF_FLUIDTEST=ticks: the water next to the carve flows in for that many 20 Hz ticks.
+            if let Some(ticks) = std::env::var("VF_FLUIDTEST").ok().and_then(|v| v.parse::<u32>().ok()) {
+                let mut fl = crate::fluid::FluidSim::default();
+                let (lo, hi) = (c - (rad + 1.0), c + (rad + 1.0));
+                fl.wake(lo.x as i32, lo.y as i32, lo.z as i32, hi.x as i32, hi.y as i32, hi.z as i32);
+                let t = std::time::Instant::now();
+                let mut n = 0;
+                while n < ticks && !fl.idle() {
+                    fl.tick(&mut world);
+                    n += 1;
+                }
+                let wet = (0..=(2.0 * rad) as i32).filter(|&d| fl.volume(&world, c.x as i32, (c.y - rad) as i32 + d, c.z as i32) > 0.0).count();
+                log::info!(target: "fluidtest", "{n} ticks in {:.1} ms, {} active, {} partial, {wet} wet cells in the hole's centre column",
+                           t.elapsed().as_secs_f64() * 1e3, fl.active_count(), fl.partial_count());
+            }
             let n = world.dirty_grid.len();
             r.gpu.sync(&ctx, &mut world);
             if spawned > 0 {
                 r.gpu.init_objects(&ctx, &world, &mut objects);
                 r.rebind_object_buffers();
             }
-            log::info!(target: "carvetest", "carved r={rad} at {:?} ({n} dirty cells, {spawned} bodies)", h.cell);
+            log::info!(target: "carvetest", "carved r={rad} at {c} ({n} dirty cells, {spawned} bodies)");
         }
     }
     if let Ok(v) = std::env::var("VF_PLACETEST") {
