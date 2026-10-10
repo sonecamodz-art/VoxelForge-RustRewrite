@@ -26,6 +26,7 @@ use crate::gfx::renderer::record::Rec;
 use crate::gfx::renderer::Renderer;
 use crate::math::Vec3;
 use crate::objects::{build_self_test_objects, VoxObject};
+use crate::player::{self as pl, Player, PlayerInput, PlayerTuning, PlayerWorld};
 use crate::voxel::world::{wm, World};
 
 const RENDER_SCALES: [f32; 4] = [1.0, 0.75, 0.6, 0.5];
@@ -48,6 +49,13 @@ struct Game {
     title_at: Instant,
     brush_radius: f32,
     place_mat: u8,
+    player: Player,
+    /// Where the player put the eye last frame: anything else moving the camera hands it over.
+    last_eye: Vec3,
+    /// Last frame was the free camera (Tab / in.walk 0).
+    was_noclip: bool,
+    /// Space went down this frame (a jump).
+    space_pressed: bool,
 }
 
 enum Phase {
@@ -218,6 +226,64 @@ impl ApplicationHandler for App {
     }
 }
 
+fn tuning() -> PlayerTuning {
+    let mut t = PlayerTuning::default();
+    t.height = cvars::PLAYER_HEIGHT.get();
+    t.crouch_height = (t.height - 3.0).max(4.0);
+    t.eye = cvars::PLAYER_EYE.get().min(t.height - 0.8);
+    t.crouch_eye = (t.eye - 3.0).max(2.0);
+    t.width = cvars::PLAYER_WIDTH.get();
+    t.gravity = cvars::PLAYER_GRAVITY.get();
+    t.jump_apex = cvars::PLAYER_JUMP.get();
+    t.walk = cvars::PLAYER_WALK.get();
+    t.sprint = cvars::PLAYER_SPRINT.get();
+    t.crouch = t.walk * 0.45; // ~1 m/s
+    t.step = cvars::PLAYER_STEP.get();
+    t.fly = cvars::IN_FLYSPEED.get();
+    t
+}
+
+impl Game {
+    /// The walking player: collision, gravity, steps, swimming; double-tap Space flies.
+    fn walk(&mut self, dt: f32) {
+        let t = tuning();
+        let k = if self.captured { self.keys } else { MoveInput::default() };
+        let axis = |a: bool, b: bool| (a as i32 - b as i32) as f32;
+        let inp = PlayerInput {
+            fwd: axis(k.forward, k.back),
+            side: axis(k.right, k.left),
+            jump_held: k.up,
+            jump_pressed: self.space_pressed && self.captured,
+            crouch: k.down,
+            sprint: k.fast,
+        };
+        let mut w = PlayerWorld { world: &self.world, objects: Some(&mut self.objects), bodies_dynamic: false };
+        if (self.cam.pos - self.last_eye).length() > 0.01 || self.was_noclip {
+            // Something else moved the camera (start, teleport, the free camera): the player
+            // takes over from there, out of the ground, flying if it isn't standing on anything.
+            self.player.crouched = false;
+            pl::player_place(&mut self.player, self.cam.pos - Vec3::new(0.0, t.eye, 0.0), &t);
+            pl::player_unstuck(&mut self.player, &t, &w);
+            let mut q = self.player;
+            q.feet.y -= 0.5;
+            self.player.flying = !pl::player_stuck(&q, &t, &w);
+        }
+        self.was_noclip = false;
+        pl::player_step(&mut self.player, &inp, self.cam.yaw, &t, &mut w, true, false, dt);
+        if self.player.feet.y < -50.0 {
+            log::info!(target: "app", "fell out of the world");
+            let g = pl::player_ground_at(&self.world, self.world.mid_x(), self.world.mid_z());
+            pl::player_place(&mut self.player, g, &t);
+            pl::player_unstuck(&mut self.player, &t, &w);
+        }
+        if !cvars::IN_BOB.get() {
+            self.player.bob_amp = 0.0;
+        }
+        self.cam.pos = pl::player_eye(&self.player);
+        self.last_eye = self.cam.pos;
+    }
+}
+
 impl Running {
     fn captured(&self) -> bool {
         matches!(&self.phase, Phase::Game(g) if g.captured)
@@ -255,6 +321,20 @@ impl Running {
             return;
         }
         match code {
+            KeyCode::Space => {
+                let Phase::Game(g) = &mut self.phase else { return };
+                if cvars::IN_WALK.get() {
+                    g.space_pressed = true;
+                    let now = g.start.elapsed().as_secs_f64();
+                    if pl::player_space_tap(&mut g.player, now, true) {
+                        log::info!(target: "app", "{}", if g.player.flying { "flying (double-tap Space to land)" } else { "walking" });
+                    }
+                }
+            }
+            KeyCode::Tab => {
+                cvars::IN_WALK.set(!cvars::IN_WALK.get());
+                log::info!(target: "app", "{}", if cvars::IN_WALK.get() { "walking" } else { "free camera" });
+            }
             KeyCode::F3 => cvars::UI_OVERLAY.set(!cvars::UI_OVERLAY.get()),
             KeyCode::F4 => cvars::R_DEBUGVIEW.set((cvars::R_DEBUGVIEW.get() + 1) % 10),
             KeyCode::F6 => {
@@ -393,6 +473,11 @@ impl Running {
                     title_at: now,
                     brush_radius: 6.0,
                     place_mat: wm::STONE,
+                    player: Player::default(),
+                    // Differs from the camera: the first frame places the player under it.
+                    last_eye: cam.pos + Vec3::splat(1e6),
+                    was_noclip: false,
+                    space_pressed: false,
                 }));
                 self.window.set_title("VoxelForge - click to look around, Esc to free the mouse");
             } else {
@@ -423,9 +508,15 @@ impl Running {
         g.last = now;
         g.frame_ms += (dt * 1e3 - g.frame_ms) * 0.1;
         g.cam.move_speed = cvars::IN_FLYSPEED.get();
-        if g.captured {
-            g.cam.fly(&g.keys, dt);
+        if cvars::IN_WALK.get() {
+            g.walk(dt);
+        } else {
+            g.was_noclip = true;
+            if g.captured {
+                g.cam.fly(&g.keys, dt);
+            }
         }
+        g.space_pressed = false;
         let time = if cvars::R_TIME_FREEZE.get() { 0.0 } else { (now - g.start).as_secs_f32() % 3600.0 };
         if cvars::R_TIME_DAYLENGTH.get() > 0.0 {
             let h = (cvars::R_TIME_HOUR.get() + dt * 24.0 / (cvars::R_TIME_DAYLENGTH.get() * 60.0)) % 24.0;

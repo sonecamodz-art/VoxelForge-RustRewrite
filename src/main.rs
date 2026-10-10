@@ -16,6 +16,7 @@ mod log;
 mod math;
 mod objects;
 mod paths;
+mod player;
 mod voxel;
 mod worldgen;
 
@@ -23,7 +24,7 @@ fn usage() {
     eprintln!(
         "usage: voxelforge [--winsize WxH] [--validation] [+set <cvar> <value>] [+exec \"cmd\"]\n\
          \x20                 [--shot out.png [--frames N] [--dump final|albedo|normal|motion]]\n\
-         \x20 window keys: WASD/Space/Ctrl fly (Shift fast), mouse look (click to capture, Esc frees),\n\
+         \x20 window keys: WASD walk (Shift sprint, Space jump, 2x Space fly), Tab free camera, mouse look (click to capture, Esc frees),\n\
          \x20              F3 stats, F4 debug view, F6 render scale, F10 reload shaders, L lighting mode,\n\
          \x20              N denoiser, [ ] exposure, wheel fly speed\n\
          \x20 cvars: VF_SET=\"name=value;...\" or +set; `help` lists them"

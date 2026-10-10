@@ -42,8 +42,9 @@ voxelforge [--winsize WxH] [--validation] [+set <cvar> <value>] [+exec "cmd"]
            [--shot out.png [--frames N] [--dump final|albedo|normal|motion]]
 ```
 
-Window keys: click to capture the mouse (Esc frees it, Esc again quits), WASD / Space / Ctrl
-to fly (Shift fast, wheel = speed), LMB carve / RMB place a sphere (`-` / `=` size, 1-9
+Window keys: click to capture the mouse (Esc frees it, Esc again quits), WASD to walk
+(Shift sprint, Ctrl / C crouch, Space jump, double-tap Space to fly / land; flying: Space / Ctrl
+up / down, wheel = speed), Tab toggles the free camera (no collision), LMB carve / RMB place a sphere (`-` / `=` size, 1-9
 material), F3 stats in the title, F4 debug views, F6 render scale, F10 reload shaders,
 F11 fullscreen, L ray traced / Standard lighting, N SVGF / raw, `[` `]` exposure.
 
@@ -75,12 +76,12 @@ Ported: the voxel storage (sparse bricks, ring/streaming mode), world generation
 world mirror (upload, incremental edit sync, chunk streaming sync, bodies + BVH), the full
 renderer (both lighting modes, water, grass wind, fog, clouds, lamps / torches, radiance cache,
 debug views, locked view), post (exposure, bloom, tonemap), the window + headless shots,
-basic carve / place editing.
+basic carve / place editing, the player controller (walking, steps, crouch, swimming, flying).
 
 Not yet ported: generators 2 / 3, endless streaming (`StreamManager`, far horizon), physics
 and destruction, fluid simulation, saves / region files, the undo stack and edit tools (shapes,
-lines, brush tools), the ImGui UI (menus, editor, map, inventory), audio, the player
-controller, weather presets, mesh import, NVIDIA DLSS / NRD and hardware ray queries.
+lines, brush tools), the ImGui UI (menus, editor, map, inventory), audio, weather presets,
+mesh import, NVIDIA DLSS / NRD and hardware ray queries.
 
 ## Debugging
 

@@ -35,6 +35,16 @@ cvars! {
     IN_SENSITIVITY: Float = Float::new("in.sensitivity", 1.0, "mouse sensitivity (1 = default)", 0.1, 4.0);
     IN_INVERT_Y: Bool = Bool::new("in.invertY", false, "invert the mouse's vertical axis");
     IN_FLYSPEED: Float = Float::new("in.flyspeed", 80.0, "flying speed, voxels per second (wheel changes it)", 5.0, 800.0);
+    IN_BOB: Bool = Bool::new("in.bob", true, "view bob while walking");
+    IN_WALK: Bool = Bool::new("in.walk", true, "walk with collision and gravity (Tab toggles the free camera)");
+    PLAYER_HEIGHT: Float = Float::new("player.height", 18.0, "player height, voxels (1.8 m)", 8.0, 40.0);
+    PLAYER_EYE: Float = Float::new("player.eye", 16.2, "eye height, voxels (1.62 m)", 6.0, 38.0);
+    PLAYER_WIDTH: Float = Float::new("player.width", 6.0, "player width, voxels (0.6 m)", 2.0, 16.0);
+    PLAYER_GRAVITY: Float = Float::new("player.gravity", 200.0, "gravity on the player, voxels/s^2 (20 m/s^2: snappy)", 20.0, 1000.0);
+    PLAYER_JUMP: Float = Float::new("player.jump", 12.0, "jump height, voxels (1.2 m)", 0.0, 60.0);
+    PLAYER_WALK: Float = Float::new("player.walk", 21.5, "walking speed, voxels/s (2.15 m/s)", 5.0, 400.0);
+    PLAYER_SPRINT: Float = Float::new("player.sprint", 50.0, "sprinting speed, voxels/s (Shift, 5 m/s)", 5.0, 400.0);
+    PLAYER_STEP: Float = Float::new("player.step", 4.0, "highest ledge walked up without jumping, voxels", 0.0, 12.0);
 
     // ---- renderer: tracing ---------------------------------------------------------------
     R_DEBUGVIEW: Int = Int::new("r.debugview", 0, "0 normal, 1 object-id tint, 2 heat.primary, 3 heat.shadow, 4 gi only, \
