@@ -26,11 +26,16 @@ use crate::gfx::renderer::record::Rec;
 use crate::gfx::renderer::Renderer;
 use crate::math::Vec3;
 use crate::objects::{build_self_test_objects, VoxObject};
+use crate::physics::{self, BodyState, Physics};
 use crate::player::{self as pl, Player, PlayerInput, PlayerTuning, PlayerWorld};
 use crate::voxel::world::{wm, World};
 
 const RENDER_SCALES: [f32; 4] = [1.0, 0.75, 0.6, 0.5];
 const PICK_REACH: f32 = 800.0;
+/// Physics runs at a fixed 60 Hz; bodies render interpolated between the last two steps.
+const PHYS_DT: f64 = 1.0 / 60.0;
+/// Steps per frame at most: beyond that the simulation slows instead of spiralling.
+const MAX_PHYS_STEPS: u32 = 4;
 
 struct Game {
     world: World,
@@ -56,6 +61,11 @@ struct Game {
     was_noclip: bool,
     /// Space went down this frame (a jump).
     space_pressed: bool,
+    phys: Physics,
+    phys_acc: f64,
+    /// Body states at the previous physics step (render interpolation).
+    phys_prev: Vec<BodyState>,
+    phys_was_on: bool,
 }
 
 enum Phase {
@@ -244,6 +254,59 @@ fn tuning() -> PlayerTuning {
 }
 
 impl Game {
+    /// Fixed-step physics; the GPU gets the bodies interpolated between the last two steps.
+    fn simulate(&mut self, ctx: &Context, dt: f32) {
+        let on = cvars::GAME_PHYSICS.get();
+        if on != self.phys_was_on {
+            self.phys_was_on = on;
+            if on {
+                physics::wake_near(&mut self.objects, Vec3::ZERO, 1e9);
+            }
+        }
+        if !on {
+            self.phys_acc = 0.0;
+            self.phys_prev.clear();
+            return;
+        }
+        self.phys.foliage_solid = cvars::PHYS_FOLIAGE.get();
+        self.phys_acc += dt as f64;
+        let mut steps = 0;
+        while self.phys_acc >= PHYS_DT && steps < MAX_PHYS_STEPS {
+            self.phys_prev.clear();
+            self.phys_prev.extend(self.objects.iter().map(BodyState::of));
+            self.phys.step(&self.world, &mut self.objects, PHYS_DT as f32);
+            self.phys_acc -= PHYS_DT;
+            steps += 1;
+        }
+        if steps == MAX_PHYS_STEPS {
+            self.phys_acc = self.phys_acc.min(PHYS_DT);
+        }
+        // Bodies that fell out of the world or were carved away entirely are removed (they
+        // would keep their atlas slots, BVH entries and a place in every ray's object walk).
+        let before = self.objects.len();
+        self.objects.retain(|o| !(o.pose.t.y < -200.0 || o.mass == 0.0));
+        if self.objects.len() != before {
+            self.r.gpu.init_objects(ctx, &self.world, &mut self.objects);
+            self.r.rebind_object_buffers();
+            self.phys_prev.clear();
+        }
+        if self.phys_prev.len() != self.objects.len() {
+            self.phys_prev.clear();
+            self.phys_prev.extend(self.objects.iter().map(BodyState::of));
+        }
+        let a = (self.phys_acc / PHYS_DT) as f32;
+        let sim: Vec<_> = self.objects.iter().map(|o| o.pose).collect();
+        for (o, p) in self.objects.iter_mut().zip(&self.phys_prev) {
+            if o.inv_mass != 0.0 {
+                o.pose = physics::interpolated_pose(o, p, a);
+            }
+        }
+        self.r.gpu.update_objects(&self.objects);
+        for (o, p) in self.objects.iter_mut().zip(sim) {
+            o.pose = p;
+        }
+    }
+
     /// The walking player: collision, gravity, steps, swimming; double-tap Space flies.
     fn walk(&mut self, dt: f32) {
         let t = tuning();
@@ -257,7 +320,7 @@ impl Game {
             crouch: k.down,
             sprint: k.fast,
         };
-        let mut w = PlayerWorld { world: &self.world, objects: Some(&mut self.objects), bodies_dynamic: false };
+        let mut w = PlayerWorld { world: &self.world, objects: Some(&mut self.objects), bodies_dynamic: cvars::GAME_PHYSICS.get() };
         if (self.cam.pos - self.last_eye).length() > 0.01 || self.was_noclip {
             // Something else moved the camera (start, teleport, the free camera): the player
             // takes over from there, out of the ground, flying if it isn't standing on anything.
@@ -334,6 +397,10 @@ impl Running {
             KeyCode::Tab => {
                 cvars::IN_WALK.set(!cvars::IN_WALK.get());
                 log::info!(target: "app", "{}", if cvars::IN_WALK.get() { "walking" } else { "free camera" });
+            }
+            KeyCode::KeyP => {
+                cvars::GAME_PHYSICS.set(!cvars::GAME_PHYSICS.get());
+                log::info!(target: "app", "physics {}", if cvars::GAME_PHYSICS.get() { "running" } else { "paused" });
             }
             KeyCode::F3 => cvars::UI_OVERLAY.set(!cvars::UI_OVERLAY.get()),
             KeyCode::F4 => cvars::R_DEBUGVIEW.set((cvars::R_DEBUGVIEW.get() + 1) % 10),
@@ -417,6 +484,7 @@ impl Running {
             }
             _ => return,
         }
+        physics::wake_near(&mut g.objects, c, rad + 12.0); // nearby bodies fall
         let t = Instant::now();
         g.r.gpu.sync(&self.ctx, &mut g.world);
         log::info!(target: "edit", "edit at {:?} r {rad}: sync {:.2} ms", h.cell, t.elapsed().as_secs_f64() * 1e3);
@@ -478,6 +546,10 @@ impl Running {
                     last_eye: cam.pos + Vec3::splat(1e6),
                     was_noclip: false,
                     space_pressed: false,
+                    phys: Physics::default(),
+                    phys_acc: 0.0,
+                    phys_prev: Vec::new(),
+                    phys_was_on: false,
                 }));
                 self.window.set_title("VoxelForge - click to look around, Esc to free the mouse");
             } else {
@@ -508,6 +580,7 @@ impl Running {
         g.last = now;
         g.frame_ms += (dt * 1e3 - g.frame_ms) * 0.1;
         g.cam.move_speed = cvars::IN_FLYSPEED.get();
+        g.simulate(&self.ctx, dt);
         if cvars::IN_WALK.get() {
             g.walk(dt);
         } else {

@@ -32,6 +32,17 @@ pub struct VoxObject {
     pub shell: Vec<u32>,
     pub asleep: bool,
     pub sleep_timer: f32,
+    /// Carries foliage (a felled tree): slips through the world's branches (physics).
+    pub tree: bool,
+    /// A felled tree's hinge (the uncut holding wood of a real felling): `hinge_local` (body
+    /// coordinates, the trunk's edge on the fall side at the cut) is held over `hinge_anchor`
+    /// (world: x / z pinned, the stump's top below it), until the trunk leans ~70 deg or 6 s
+    /// pass. Until it leans ~8 deg toward `fall_dir` (world, horizontal) it keeps tipping that way.
+    pub hinged: bool,
+    pub hinge_local: Vec3,
+    pub hinge_anchor: Vec3,
+    pub fall_dir: Vec3,
+    pub hinge_age: f32,
 }
 
 /// Result of [`VoxObject::ensure_contains`]: `shift` is the offset added to existing content
@@ -64,6 +75,12 @@ impl VoxObject {
             shell: Vec::new(),
             asleep: false,
             sleep_timer: 0.0,
+            tree: false,
+            hinged: false,
+            hinge_local: Vec3::ZERO,
+            hinge_anchor: Vec3::ZERO,
+            fall_dir: Vec3::ZERO,
+            hinge_age: 0.0,
         }
     }
 
@@ -136,64 +153,83 @@ impl VoxObject {
         self.pose.t.z -= dz;
         self.center.x -= dx;
         self.center.z -= dz;
+        self.hinge_anchor.x -= dx;
+        self.hinge_anchor.z -= dz;
     }
 
-    /// Mass, centre of mass, inertia and the surface shell from the voxels (rigid body setup).
+    /// (Re)compute mass, centre of mass, inverse inertia and the surface shell from the voxels.
+    /// Call after any edit / growth. Also seeds `rot_q` from the pose and clears the hinge.
+    ///
+    /// Walks only the non-empty bricks (the C++ engine scanned every cell of the box twice).
     pub fn init_body(&mut self) {
+        /// Shell samples pack 10 bits per axis: voxels past 1023 get none.
+        const SHELL_MAX: i32 = 1024;
         let v = &self.vol;
-        let (mut m, mut c) = (0.0f64, [0.0f64; 3]);
-        let mut cov = [[0.0f64; 3]; 3];
-        let mut shell = Vec::new();
-        for z in 0..v.nz {
-            for y in 0..v.ny {
-                for x in 0..v.nx {
-                    let mat = v.get_voxel(x, y, z);
-                    if mat == 0 {
-                        continue;
-                    }
-                    let d = material_density(mat) as f64;
-                    let p = [x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5];
-                    m += d;
-                    for a in 0..3 {
-                        c[a] += d * p[a];
-                        for b in 0..3 {
-                            cov[a][b] += d * p[a] * p[b];
+        self.shell.clear();
+        self.tree = false;
+        self.hinged = false;
+        self.hinge_age = 0.0;
+        // Pass 1: mass, centre of mass, shell (brick by brick, voxels of each in z, y, x order).
+        let (mut total, mut c) = (0.0f64, [0.0f64; 3]);
+        let mut solid: Vec<(i32, i32, i32, f64)> = Vec::new();
+        for gi in 0..v.grid.len() {
+            if v.grid[gi] == 0 {
+                continue;
+            }
+            let (bx, by, bz) = v.brick_coords(gi);
+            let (x0, y0, z0) = (bx * BRICK, by * BRICK, bz * BRICK);
+            for lz in 0..BRICK {
+                for ly in 0..BRICK {
+                    for lx in 0..BRICK {
+                        let (x, y, z) = (x0 + lx, y0 + ly, z0 + lz);
+                        let m = v.get_voxel(x, y, z);
+                        if m == 0 {
+                            continue;
                         }
-                    }
-                    let exposed = [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)]
-                        .iter()
-                        .any(|&(dx, dy, dz)| v.get_voxel(x + dx, y + dy, z + dz) == 0);
-                    if exposed {
-                        shell.push(x as u32 | (y as u32) << 10 | (z as u32) << 20);
+                        self.tree |= crate::voxel::world::wm::is_foliage_voxel(m);
+                        let w = material_density(m) as f64;
+                        total += w;
+                        c[0] += (x as f64 + 0.5) * w;
+                        c[1] += (y as f64 + 0.5) * w;
+                        c[2] += (z as f64 + 0.5) * w;
+                        solid.push((x, y, z, w));
+                        let surf = v.get_voxel(x + 1, y, z) == 0
+                            || v.get_voxel(x - 1, y, z) == 0
+                            || v.get_voxel(x, y + 1, z) == 0
+                            || v.get_voxel(x, y - 1, z) == 0
+                            || v.get_voxel(x, y, z + 1) == 0
+                            || v.get_voxel(x, y, z - 1) == 0;
+                        if surf && x < SHELL_MAX && y < SHELL_MAX && z < SHELL_MAX {
+                            self.shell.push(x as u32 | (y as u32) << 10 | (z as u32) << 20);
+                        }
                     }
                 }
             }
         }
-        self.shell = shell;
-        if m <= 0.0 {
-            self.mass = 0.0;
-            self.inv_mass = 0.0;
+        self.mass = total as f32;
+        self.inv_mass = if total > 0.0 { 1.0 / total as f32 } else { 0.0 };
+        if solid.is_empty() {
             return;
         }
-        let com = [c[0] / m, c[1] / m, c[2] / m];
-        // Inertia about the centre of mass (+ each voxel's own 1/6 m a^2 term).
-        let mut i = [[0.0f64; 3]; 3];
-        let tr = (0..3).map(|a| cov[a][a] - m * com[a] * com[a]).sum::<f64>();
-        for a in 0..3 {
-            for b in 0..3 {
-                let cab = cov[a][b] - m * com[a] * com[b];
-                i[a][b] = if a == b { tr - cab + m / 6.0 } else { -cab };
-            }
-        }
-        let im = Mat3::from_cols(
-            Vec3::new(i[0][0] as f32, i[1][0] as f32, i[2][0] as f32),
-            Vec3::new(i[0][1] as f32, i[1][1] as f32, i[2][1] as f32),
-            Vec3::new(i[0][2] as f32, i[1][2] as f32, i[2][2] as f32),
-        );
-        self.mass = m as f32;
-        self.inv_mass = 1.0 / m as f32;
+        let com = [c[0] / total, c[1] / total, c[2] / total];
         self.com = Vec3::new(com[0] as f32, com[1] as f32, com[2] as f32);
-        self.inv_inertia_local = if im.determinant().abs() > 1e-12 { im.inverse() } else { Mat3::IDENTITY };
+        // Pass 2: the inertia tensor about the centre of mass.
+        let (mut ixx, mut iyy, mut izz, mut ixy, mut ixz, mut iyz) = (0.0f64, 0.0, 0.0, 0.0, 0.0, 0.0);
+        for &(x, y, z, w) in &solid {
+            let (rx, ry, rz) = (x as f64 + 0.5 - com[0], y as f64 + 0.5 - com[1], z as f64 + 0.5 - com[2]);
+            ixx += w * (ry * ry + rz * rz);
+            iyy += w * (rx * rx + rz * rz);
+            izz += w * (rx * rx + ry * ry);
+            ixy -= w * rx * ry;
+            ixz -= w * rx * rz;
+            iyz -= w * ry * rz;
+        }
+        let i = Mat3::from_cols(
+            Vec3::new(ixx as f32, ixy as f32, ixz as f32),
+            Vec3::new(ixy as f32, iyy as f32, iyz as f32),
+            Vec3::new(ixz as f32, iyz as f32, izz as f32),
+        );
+        self.inv_inertia_local = if i.determinant().abs() < 1e-12 { Mat3::IDENTITY } else { i.inverse() };
         self.rot_q = Quat::from_mat3(&self.pose.r);
     }
 }

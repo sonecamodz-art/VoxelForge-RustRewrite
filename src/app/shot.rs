@@ -123,6 +123,21 @@ pub fn run_shot(a: &ShotArgs) -> i32 {
         r.gpu.sync(&ctx, &mut world);
         log::info!(target: "placetest", "placed mat={mat} ball at {:.0},{:.0},{:.0}", c.x, c.y, c.z);
     }
+    // Physics self-test: VF_SIMTEST=steps runs that many 60 Hz steps so the hovering bodies
+    // fall and settle, then uploads their poses.
+    if let Some(steps) = std::env::var("VF_SIMTEST").ok().and_then(|v| v.parse::<u32>().ok()) {
+        crate::physics::wake_near(&mut objects, crate::math::Vec3::ZERO, 1e9);
+        let mut ph = crate::physics::Physics::default();
+        let y0 = objects.first().map_or(0.0, |o| o.pose.t.y);
+        let t = std::time::Instant::now();
+        for _ in 0..steps {
+            ph.step(&world, &mut objects, 1.0 / 60.0);
+        }
+        r.gpu.update_objects(&objects);
+        let asleep = objects.iter().filter(|o| o.asleep).count();
+        log::info!(target: "simtest", "{} bodies, {steps} steps in {:.1} ms, body0 y {y0:.1} -> {:.1}, {asleep} asleep",
+                   objects.len(), t.elapsed().as_secs_f64() * 1e3, objects.first().map_or(0.0, |o| o.pose.t.y));
+    }
     let motion = a.dump == "motion";
     let pan = if motion { 0.02 } else { 0.0 };
     let mut cam_now = cam;

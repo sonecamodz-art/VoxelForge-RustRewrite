@@ -35,6 +35,8 @@ cvars! {
     IN_SENSITIVITY: Float = Float::new("in.sensitivity", 1.0, "mouse sensitivity (1 = default)", 0.1, 4.0);
     IN_INVERT_Y: Bool = Bool::new("in.invertY", false, "invert the mouse's vertical axis");
     IN_FLYSPEED: Float = Float::new("in.flyspeed", 80.0, "flying speed, voxels per second (wheel changes it)", 5.0, 800.0);
+    GAME_PHYSICS: Bool = Bool::new("game.physics", true, "physics running: loose pieces fall, collide and settle (P pauses it)");
+    PHYS_FOLIAGE: Bool = Bool::new("phys.foliage", false, "falling bodies collide with the world's foliage and thin branches");
     IN_BOB: Bool = Bool::new("in.bob", true, "view bob while walking");
     IN_WALK: Bool = Bool::new("in.walk", true, "walk with collision and gravity (Tab toggles the free camera)");
     PLAYER_HEIGHT: Float = Float::new("player.height", 18.0, "player height, voxels (1.8 m)", 8.0, 40.0);

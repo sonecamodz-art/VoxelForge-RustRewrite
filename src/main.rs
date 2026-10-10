@@ -16,6 +16,7 @@ mod log;
 mod math;
 mod objects;
 mod paths;
+mod physics;
 mod player;
 mod voxel;
 mod worldgen;

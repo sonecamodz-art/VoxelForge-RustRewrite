@@ -46,7 +46,7 @@ Window keys: click to capture the mouse (Esc frees it, Esc again quits), WASD to
 (Shift sprint, Ctrl / C crouch, Space jump, double-tap Space to fly / land; flying: Space / Ctrl
 up / down, wheel = speed), Tab toggles the free camera (no collision), LMB carve / RMB place a sphere (`-` / `=` size, 1-9
 material), F3 stats in the title, F4 debug views, F6 render scale, F10 reload shaders,
-F11 fullscreen, L ray traced / Standard lighting, N SVGF / raw, `[` `]` exposure.
+F11 fullscreen, P pause physics, L ray traced / Standard lighting, N SVGF / raw, `[` `]` exposure.
 
 Every setting is a console variable (`src/cvars.rs`): `+set r.lighting standard`,
 `VF_SET="r.fog.density=2;r.clouds.coverage=0.7"`, or `settings.cfg` next to the game.
@@ -71,23 +71,26 @@ its camera.
 
 ## Status of the port
 
-Ported: the voxel storage (sparse bricks, ring/streaming mode), world generation 1
-(terrain, space-colonisation trees, pines, bushes, logs, the tower, landmark spheres), the GPU
-world mirror (upload, incremental edit sync, chunk streaming sync, bodies + BVH), the full
-renderer (both lighting modes, water, grass wind, fog, clouds, lamps / torches, radiance cache,
-debug views, locked view), post (exposure, bloom, tonemap), the window + headless shots,
-basic carve / place editing, the player controller (walking, steps, crouch, swimming, flying).
+Ported: the voxel storage (sparse bricks, ring/streaming mode), world generation 1 (terrain,
+space-colonisation trees, pines, bushes, logs, the tower, landmark spheres), the GPU world
+mirror (upload, incremental edit sync, chunk streaming sync, bodies + BVH), the full renderer
+(both lighting modes, water, grass wind, fog, clouds, lamps / torches, radiance cache, debug
+views, locked view), post (exposure, bloom, tonemap), the window + headless shots, basic carve
+/ place editing, the player controller (walking, steps, crouch, swimming, flying), rigid-body
+physics (voxel-shell contacts, warm-started sequential impulses with friction, sleeping,
+felled-tree hinges; fixed 60 Hz with interpolated rendering).
 
-Not yet ported: generators 2 / 3, endless streaming (`StreamManager`, far horizon), physics
-and destruction, fluid simulation, saves / region files, the undo stack and edit tools (shapes,
-lines, brush tools), the ImGui UI (menus, editor, map, inventory), audio, weather presets,
-mesh import, NVIDIA DLSS / NRD and hardware ray queries.
+Not yet ported: generators 2 / 3, endless streaming (`StreamManager`, far horizon), destruction
+(cutting loose pieces into bodies), fluid simulation, saves / region files, the undo stack and
+edit tools (shapes, lines, brush tools), the ImGui UI (menus, editor, map, inventory), audio,
+weather presets, mesh import, NVIDIA DLSS / NRD and hardware ray queries.
 
 ## Debugging
 
 `--validation` enables the Khronos validation layer. `VF_SKIP=gi,fog` skips passes by label,
-`VF_MAXPASS=N` records only the first N dispatches, `VF_ROBUST=1` enables robust buffer /
-image access, `VF_LOG=debug|trace` raises the log level.
+`VF_MAXPASS=N` records only the first N dispatches, `VF_ROBUST=1` enables robust buffer / image
+access, `VF_SIMTEST=steps` settles the bodies before a `--shot`, `VF_LOG=debug|trace` raises
+the log level.
 
 Known issue: Mesa's software driver (llvmpipe / lavapipe) crashes in the GI and froxel passes
 with emissive-light sampling on (a driver codegen bug reading a uniform block in divergent
