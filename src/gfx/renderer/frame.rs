@@ -671,6 +671,12 @@ impl Renderer {
         self.gi_cache_clear = true;
     }
 
+    /// A player edit changed the world in voxel box [lo, hi): the Standard probes around it
+    /// re-settle next frame (a carved hole frees buried probes; a placed wall buries some).
+    pub fn note_world_edit(&mut self, lo: [i32; 3], hi: [i32; 3]) {
+        self.std.edit_boxes.push([lo[0], lo[1], lo[2], hi[0], hi[1], hi[2]]);
+    }
+
     /// Endless worlds: the far horizon's state (on, each level's window in the engine's texels,
     /// the radius inside which the voxels are trusted) and its finished / cleared tiles.
     pub fn update_horizon(&mut self, ctx: &crate::gfx::context::Context, on: bool, win: [i32; 10], inner_radius: i32, tiles: &[crate::horizon::Tile]) {

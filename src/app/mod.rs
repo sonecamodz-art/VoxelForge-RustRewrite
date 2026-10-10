@@ -1,6 +1,7 @@
 //! The application layer: the headless shot / bench paths and the game window.
 pub mod endless;
 pub mod saves;
+pub mod scene_edit;
 pub mod shot;
 pub mod swapchain;
 pub mod window;

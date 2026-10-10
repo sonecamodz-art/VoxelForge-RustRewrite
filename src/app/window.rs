@@ -29,12 +29,13 @@ use crate::objects::VoxObject;
 use crate::fluid::FluidSim;
 use super::endless::{origin_for, Endless, ORIGIN_STEP};
 use super::saves;
+use super::scene_edit::{brush_edit, brush_preview_pc, brush_target, scene_raycast, BrushOp, BrushTarget, EditEnv, PREVIEW_CARVE, PREVIEW_PLACE};
+use crate::edit::undo::UndoStack;
 use crate::physics::{self, BodyState, Physics};
 use crate::player::{self as pl, Player, PlayerInput, PlayerTuning, PlayerWorld};
 use crate::voxel::world::{wm, World};
 
 const RENDER_SCALES: [f32; 4] = [1.0, 0.75, 0.6, 0.5];
-const PICK_REACH: f32 = 800.0;
 /// Physics runs at a fixed 60 Hz; bodies render interpolated between the last two steps.
 const PHYS_DT: f64 = 1.0 / 60.0;
 /// Steps per frame at most: beyond that the simulation slows instead of spiralling.
@@ -55,8 +56,17 @@ struct Game {
     /// Smoothed frame time (ms) and the last title refresh.
     frame_ms: f32,
     title_at: Instant,
-    brush_radius: f32,
     place_mat: u8,
+    /// Edit undo history (Ctrl+Z / Ctrl+Y).
+    undo: UndoStack,
+    /// Mouse buttons held, pressed since the last frame, and the dab repeat timer.
+    lmb: bool,
+    rmb: bool,
+    hit_l: bool,
+    hit_r: bool,
+    repeat: f32,
+    /// Where the brush lands this frame (preview + edit).
+    target: Option<BrushTarget>,
     /// A status line shown in the title for a few seconds (saves, errors).
     notice: Option<(String, Instant)>,
     player: Player,
@@ -99,6 +109,8 @@ struct Running {
     slot: usize,
     need_resize: bool,
     phase: Phase,
+    /// Keyboard modifiers held (Ctrl+Z...).
+    mods: winit::keyboard::ModifiersState,
 }
 
 struct App {
@@ -174,6 +186,7 @@ impl ApplicationHandler for App {
             cmds,
             slot: 0,
             need_resize: false,
+            mods: Default::default(),
             phase: Phase::Loading { thread: Some(thread), progress },
         });
     }
@@ -207,7 +220,8 @@ impl ApplicationHandler for App {
                 }
                 run.key(code, down, event.repeat);
             }
-            WindowEvent::MouseInput { state: ElementState::Pressed, button, .. } => run.click(button),
+            WindowEvent::MouseInput { state, button, .. } => run.mouse(button, state == ElementState::Pressed),
+            WindowEvent::ModifiersChanged(m) => run.mods = m.state(),
             WindowEvent::MouseWheel { delta, .. } => {
                 let dy = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y,
@@ -262,6 +276,74 @@ fn tuning() -> PlayerTuning {
 }
 
 impl Game {
+    fn edit_env<'a>(&'a mut self, ctx: &'a Context) -> EditEnv<'a> {
+        EditEnv { ctx, r: &mut self.r, world: &mut self.world, objects: &mut self.objects, fluid: &mut self.fluid }
+    }
+
+    /// Play-mode building: LMB carves, RMB places (held: a dab every 0.2 s), never into the
+    /// player. Also refreshes the brush target for the preview.
+    fn build(&mut self, ctx: &Context, dt: f32) {
+        const REPEAT: f32 = 0.2;
+        self.repeat -= dt;
+        let on = self.captured && cvars::R_BUILD.get();
+        self.target = if on { brush_target(&self.world, &self.objects, self.cam.pos, self.cam.forward()) } else { None };
+        let (hit_l, hit_r) = (std::mem::take(&mut self.hit_l), std::mem::take(&mut self.hit_r));
+        let carve = self.lmb || hit_l;
+        let place = !carve && (self.rmb || hit_r);
+        if !on || (!carve && !place) || (self.repeat > 0.0 && !hit_l && !hit_r) {
+            return;
+        }
+        let Some(t) = self.target else { return };
+        self.repeat = REPEAT;
+        if place && t.obj.is_none() && cvars::IN_WALK.get() {
+            // Not into yourself.
+            let tune = tuning();
+            if t.place.cells().any(|(x, y, z)| pl::player_overlaps_cell(&self.player, &tune, [x, y, z])) {
+                self.notify("You're in the way".into());
+                return;
+            }
+        }
+        let (op, mat) = if carve { (BrushOp::Carve, 0) } else { (BrushOp::Place, self.place_mat) };
+        let rec = brush_edit(&mut self.edit_env(ctx), &t, op, mat);
+        self.undo.push(rec);
+        self.phys_prev.clear();
+    }
+
+    /// Ctrl+Z / Ctrl+Y.
+    fn undo_redo(&mut self, ctx: &Context, redo: bool) {
+        let a = if redo { self.undo.redo(&mut self.world, &mut self.objects) } else { self.undo.undo(&mut self.world, &mut self.objects) };
+        if !a.any {
+            self.notify(format!("Nothing to {}", if redo { "redo" } else { "undo" }));
+            return;
+        }
+        if a.world {
+            self.r.gpu.sync(ctx, &mut self.world);
+            self.r.note_world_edit(a.lo, a.hi.map(|v| v + 1));
+            self.fluid.wake(a.lo[0] - 1, a.lo[1] - 1, a.lo[2] - 1, a.hi[0] + 1, a.hi[1] + 1, a.hi[2] + 1);
+        }
+        if a.bodies {
+            self.r.gpu.init_objects(ctx, &self.world, &mut self.objects);
+            self.r.rebind_object_buffers();
+            self.phys_prev.clear();
+        }
+        let (u, r) = self.undo.len();
+        self.notify(format!("{}: {} ({u} undo / {r} redo, {} KB)", if redo { "Redo" } else { "Undo" }, a.label, self.undo.bytes() / 1024));
+    }
+
+    /// MMB: hold the block under the crosshair.
+    fn pick_block(&mut self) {
+        let Some(h) = scene_raycast(&self.world, &self.objects, self.cam.pos, self.cam.forward(), 2000.0) else { return };
+        let c = h.hit.cell;
+        let m = match h.obj {
+            Some(i) => self.objects[i].vol.get_voxel(c[0], c[1], c[2]),
+            None => self.world.get_voxel(c[0], c[1], c[2]),
+        };
+        if m != 0 {
+            self.place_mat = m;
+            self.notify(format!("Holding material {m}"));
+        }
+    }
+
     /// Endless worlds: the floating origin, the view distance, chunks in / out around the camera.
     fn stream(&mut self, ctx: &Context) {
         let Some(e) = self.endless.as_mut() else { return };
@@ -282,6 +364,7 @@ impl Game {
                 p.t -= d;
             }
             self.fluid.shift(dx, dz);
+            self.undo.shift(dx, dz);
             self.r.shift_origin(dx, dz);
         }
         if e.apply_view_distance(&mut self.world, self.cam.pos.x, self.cam.pos.z) {
@@ -308,8 +391,10 @@ impl Game {
         } else {
             match saves::quick_load(&mut io) {
                 Ok(n) => {
-                    // A new scene: no history to blend from.
+                    // A new scene: no history to blend from, nothing to undo.
                     self.prev_cam = self.cam;
+                    self.undo.clear();
+                    self.target = None;
                     self.phys_prev.clear();
                     self.fluid_dirty = false;
                     format!("Loaded {n}")
@@ -520,74 +605,46 @@ impl Running {
                 g.place_mat = MATS[i];
                 log::info!(target: "app", "place material {}", g.place_mat);
             }
-            KeyCode::Equal => {
-                let Phase::Game(g) = &mut self.phase else { return };
-                g.brush_radius = (g.brush_radius * 1.25).min(64.0);
+            KeyCode::Equal | KeyCode::Minus => {
+                let s = cvars::R_BRUSH_SIZE.get();
+                let step = (s / 4).max(1);
+                cvars::R_BRUSH_SIZE.set(if code == KeyCode::Equal { s + step } else { s - step });
             }
-            KeyCode::Minus => {
+            KeyCode::KeyB => {
+                cvars::R_BRUSH_SHAPE.set(if cvars::R_BRUSH_SHAPE.is("cube") { "sphere" } else { "cube" });
+            }
+            KeyCode::KeyF => {
+                cvars::R_BUILD.set(!cvars::R_BUILD.get());
                 let Phase::Game(g) = &mut self.phase else { return };
-                g.brush_radius = (g.brush_radius / 1.25).max(1.0);
+                g.notify(format!("Build mode {}", if cvars::R_BUILD.get() { "on" } else { "off" }));
+            }
+            KeyCode::KeyZ | KeyCode::KeyY if self.mods.control_key() => {
+                let redo = code == KeyCode::KeyY || self.mods.shift_key();
+                let Phase::Game(g) = &mut self.phase else { return };
+                g.undo_redo(&self.ctx, redo);
             }
             _ => {}
         }
     }
 
-    fn click(&mut self, button: MouseButton) {
-        if !self.captured() {
+    fn mouse(&mut self, button: MouseButton, down: bool) {
+        if down && !self.captured() {
             self.set_captured(true);
             return;
         }
         let Phase::Game(g) = &mut self.phase else { return };
-        // Aim through water; carve (left) or place (right) a sphere where the ray hits.
-        let h = g.world.raycast(g.cam.pos, g.cam.forward(), PICK_REACH, wm::WATER);
-        if !h.hit {
-            return;
-        }
-        let rad = g.brush_radius;
-        let c = Vec3::new(h.cell[0] as f32 + 0.5, h.cell[1] as f32 + 0.5, h.cell[2] as f32 + 0.5);
-        let mut spawned = 0;
         match button {
             MouseButton::Left => {
-                g.world.fill_sphere(c.x, c.y, c.z, rad, wm::AIR);
-                // Water next to the edit flows into the hole.
-                let (lo, hi) = (c - (rad + 1.0), c + (rad + 1.0));
-                g.fluid.wake(lo.x as i32, lo.y as i32, lo.z as i32, hi.x as i32, hi.y as i32, hi.z as i32);
-                // Pieces cut loose fall as bodies (a cut tree topples).
-                spawned = crate::destruction::world_carve_detach(&mut g.world, c, rad, &mut g.objects, None);
+                g.lmb = down;
+                g.hit_l |= down;
             }
             MouseButton::Right => {
-                let n = Vec3::new(h.normal[0] as f32, h.normal[1] as f32, h.normal[2] as f32);
-                let p = c + n * rad;
-                if g.place_mat != wm::WATER {
-                    // Water the ball fills moves out of its way (up and around it).
-                    let r2 = rad * rad;
-                    let (lo, hi) = ((p - rad).floor(), (p + rad).ceil());
-                    for z in lo.z as i32..=hi.z as i32 {
-                        for y in lo.y as i32..=hi.y as i32 {
-                            for x in lo.x as i32..=hi.x as i32 {
-                                let d = Vec3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5) - p;
-                                if d.length_squared() <= r2 && g.fluid.volume(&g.world, x, y, z) > 0.0 {
-                                    g.fluid.displace(&mut g.world, x, y, z);
-                                }
-                            }
-                        }
-                    }
-                }
-                g.world.fill_sphere(p.x, p.y, p.z, rad, g.place_mat);
-                let (lo, hi) = (p - (rad + 1.0), p + (rad + 1.0));
-                g.fluid.wake(lo.x as i32, lo.y as i32, lo.z as i32, hi.x as i32, hi.y as i32, hi.z as i32);
+                g.rmb = down;
+                g.hit_r |= down;
             }
-            _ => return,
+            MouseButton::Middle if down => g.pick_block(),
+            _ => {}
         }
-        physics::wake_near(&mut g.objects, c, rad + 12.0); // nearby bodies fall
-        let t = Instant::now();
-        g.r.gpu.sync(&self.ctx, &mut g.world);
-        if spawned > 0 {
-            g.r.gpu.init_objects(&self.ctx, &g.world, &mut g.objects);
-            g.r.rebind_object_buffers();
-            g.phys_prev.clear();
-        }
-        log::info!(target: "edit", "edit at {:?} r {rad}: sync {:.2} ms", h.cell, t.elapsed().as_secs_f64() * 1e3);
     }
 
     /// Render sizes for the swapchain extent and r.scale.
@@ -643,8 +700,14 @@ impl Running {
                     last: now,
                     frame_ms: 16.0,
                     title_at: now,
-                    brush_radius: 6.0,
                     place_mat: wm::STONE,
+                    undo: UndoStack::default(),
+                    lmb: false,
+                    rmb: false,
+                    hit_l: false,
+                    hit_r: false,
+                    repeat: 0.0,
+                    target: None,
                     notice: None,
                     player: Player::default(),
                     // Differs from the camera: the first frame places the player under it.
@@ -708,6 +771,7 @@ impl Running {
         }
         g.space_pressed = false;
         g.stream(&self.ctx);
+        g.build(&self.ctx, dt);
         let time = if cvars::R_TIME_FREEZE.get() { 0.0 } else { (now - g.start).as_secs_f32() % 3600.0 };
         if cvars::R_TIME_DAYLENGTH.get() > 0.0 {
             let h = (cvars::R_TIME_HOUR.get() + dt * 24.0 / (cvars::R_TIME_DAYLENGTH.get() * 60.0)) % 24.0;
@@ -743,6 +807,10 @@ impl Running {
             r.record(&rec);
         }
         r.record_dust(&rec, w, h);
+        if let Some(t) = g.target.filter(|_| cvars::R_BRUSH_PREVIEW.get()) {
+            let pc = brush_preview_pc(&t, &g.world.palette, g.place_mat, (w, h), PREVIEW_CARVE | PREVIEW_PLACE);
+            r.record_brush_preview(&rec, &pc);
+        }
         // out_tex -> swapchain (Y-flip: row 0 is the bottom), then present.
         let simg = self.sc.images[img as usize];
         r.out_to_transfer_src(&dev, cb);
@@ -843,8 +911,8 @@ impl Running {
         );
         if cvars::UI_OVERLAY.get() {
             let p = g.cam.pos;
-            t += &format!("  pos {:.0},{:.0},{:.0} yaw {:.2} pitch {:.2}  brush r{:.0} mat {}", p.x, p.y, p.z, g.cam.yaw, g.cam.pitch,
-                          g.brush_radius, g.place_mat);
+            t += &format!("  pos {:.0},{:.0},{:.0} yaw {:.2} pitch {:.2}  brush {} {} mat {}", p.x, p.y, p.z, g.cam.yaw, g.cam.pitch,
+                          cvars::R_BRUSH_SHAPE.get(), cvars::R_BRUSH_SIZE.get(), g.place_mat);
             let top: Vec<String> = g.r.pass_ms.iter().map(|(n, ms)| format!("{n} {ms:.2}")).collect();
             t += &format!("  [{}]", top.join(", "));
         }

@@ -44,6 +44,11 @@ cvars! {
     IN_FLYSPEED: Float = Float::new("in.flyspeed", 80.0, "flying speed, voxels per second (wheel changes it)", 5.0, 800.0);
     GAME_PHYSICS: Bool = Bool::new("game.physics", true, "physics running: loose pieces fall, collide and settle (P pauses it)");
     PHYS_FOLIAGE: Bool = Bool::new("phys.foliage", false, "falling bodies collide with the world's foliage and thin branches");
+    R_BRUSH_SHAPE: Str = Str::new("r.brush.shape", "sphere", "edit brush shape (B cycles)", &["sphere", "cube"]);
+    R_BRUSH_SIZE: Int = Int::new("r.brush.size", 8, "edit brush size: voxels across (1 = one voxel; - / = keys)", 1, 40);
+    R_BRUSH_REACH: Float = Float::new("r.brush.reach", 40.0, "how far away you can carve / place (voxels)", 8.0, 200.0);
+    R_BRUSH_PREVIEW: Bool = Bool::new("r.brush.preview", true, "show exactly which voxels LMB removes (red) and RMB adds (ghost) where you aim");
+    R_BUILD: Bool = Bool::new("r.build", true, "build mode (F): the brush preview, LMB carves / RMB places / MMB paints; off = just look around");
     IN_BOB: Bool = Bool::new("in.bob", true, "view bob while walking");
     IN_WALK: Bool = Bool::new("in.walk", true, "walk with collision and gravity (Tab toggles the free camera)");
     PLAYER_HEIGHT: Float = Float::new("player.height", 18.0, "player height, voxels (1.8 m)", 8.0, 40.0);

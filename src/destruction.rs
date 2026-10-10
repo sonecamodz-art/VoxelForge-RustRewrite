@@ -161,8 +161,8 @@ const M_ATTACHED: u8 = 2;
 const M_ISLAND: u8 = 3;
 const M_LEAF_SEEN: u8 = 4;
 
-/// Called with each piece's voxel bounds before it leaves the world (undo).
-pub type DetachRegionFn<'a> = &'a mut dyn FnMut([i32; 3], [i32; 3]);
+/// Called with the world and each piece's voxel bounds before it leaves the world (undo).
+pub type DetachRegionFn<'a> = &'a mut dyn FnMut(&World, [i32; 3], [i32; 3]);
 
 struct Detach<'a> {
     world: &'a mut World,
@@ -224,7 +224,7 @@ impl Detach<'_> {
         }
         let (lo, hi) = bounds(cells);
         if let Some(f) = self.before_remove.as_mut() {
-            f(lo, hi);
+            f(self.world, lo, hi);
         }
         if cells.len() < MIN_ISLAND_VOXELS {
             for c in cells {

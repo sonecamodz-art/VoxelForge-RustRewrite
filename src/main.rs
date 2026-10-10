@@ -11,6 +11,7 @@ mod camera;
 mod cvar;
 mod cvars;
 mod destruction;
+mod edit;
 mod fluid;
 mod gfx;
 mod hash;

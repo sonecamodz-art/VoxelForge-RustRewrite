@@ -45,10 +45,12 @@ voxelforge [--winsize WxH] [--validation] [--load <world>] [+set <cvar> <value>]
 
 Window keys: click to capture the mouse (Esc frees it, Esc again quits), WASD to walk (Shift
 sprint, Ctrl / C crouch, Space jump, double-tap Space to fly / land; flying: Space / Ctrl up /
-down, wheel = speed), Tab toggles the free camera (no collision), LMB carve / RMB place a
-sphere (`-` / `=` size, 1-9 material), F3 stats in the title, F4 debug views, F6 render scale,
-F10 reload shaders, F5 / F9 quick save / load, F11 fullscreen, P pause physics, L ray traced /
-Standard lighting, N SVGF / raw, `[` `]` exposure.
+down, wheel = speed), Tab toggles the free camera (no collision), F build mode: LMB carve / RMB
+place with the brush (held: repeats; `-` / `=` size, B sphere / cube, 1-9 material, MMB picks
+the block you aim at; the preview shows the voxels it will change), Ctrl+Z / Ctrl+Y undo /
+redo, F3 stats in the title, F4 debug views, F6 render scale, F10 reload shaders, F5 / F9 quick
+save / load, F11 fullscreen, P pause physics, L ray traced / Standard lighting, N SVGF / raw,
+`[` `]` exposure.
 
 Every setting is a console variable (`src/cvars.rs`): `+set r.lighting standard`,
 `VF_SET="r.fog.density=2;r.clouds.coverage=0.7"`, or `settings.cfg` next to the game. `--shot`
@@ -86,21 +88,22 @@ Ported: the voxel storage (sparse bricks, ring/streaming mode), world generation
 space-colonisation trees, pines, bushes, logs, the tower, landmark spheres), the GPU world
 mirror (upload, incremental edit sync, chunk streaming sync, bodies + BVH), the full renderer
 (both lighting modes, water, grass wind, fog, clouds, lamps / torches, radiance cache, debug
-views, locked view), post (exposure, bloom, tonemap), the window + headless shots, basic carve
-/ place editing, the player controller (walking, steps, crouch, swimming, flying), rigid-body
-physics (voxel-shell contacts, warm-started sequential impulses with friction, sleeping,
-felled-tree hinges; fixed 60 Hz with interpolated rendering), destruction (carved-loose pieces
-become bodies, a cut tree takes its own crown and topples toward the cut; bodies split), water
-flow (a volume-conserving cellular fluid: water falls, spreads, refills from its body's surface
-and drains lakes level), saves (the C++ engine's `.vfworld` format, v1-v6, written as v6; quick
+views, locked view), post (exposure, bloom, tonemap), the window + headless shots, brush
+editing (carve / place / paint, on the world or on bodies, with undo / redo by brick deltas),
+the player controller (walking, steps, crouch, swimming, flying), rigid-body physics
+(voxel-shell contacts, warm-started sequential impulses with friction, sleeping, felled-tree
+hinges; fixed 60 Hz with interpolated rendering), destruction (carved-loose pieces become
+bodies, a cut tree takes its own crown and topples toward the cut; bodies split), water flow (a
+volume-conserving cellular fluid: water falls, spreads, refills from its body's surface and
+drains lakes level), saves (the C++ engine's `.vfworld` format, v1-v6, written as v6; quick
 save / load with thumbnails), endless worlds (chunks streamed around the camera on worker
 threads with a RAM cache of the ones left behind, edited chunks in region files beside the
 save, a floating origin; an old fixed-size save converts, its land kept chunk for chunk), the
 far horizon (a 5-level clipmap of the generator's terrain, lakes and tree crowns, ~6 km).
 
-Not yet ported: generators 2 / 3, the explored map, the undo stack and edit tools (shapes,
-lines, brush tools), the ImGui UI (menus, editor, map, inventory), audio, weather presets, mesh
-import, NVIDIA DLSS / NRD and hardware ray queries.
+Not yet ported: generators 2 / 3, the explored map, the shape / line / region tools, the ImGui
+UI (menus, editor, map, inventory), audio, weather presets, mesh import, NVIDIA DLSS / NRD and
+hardware ray queries.
 
 ## Debugging
 

@@ -117,6 +117,26 @@ pub fn run_shot(a: &ShotArgs) -> i32 {
         e.settle_horizon(&ctx, &mut r, cam.pos, secs);
     }
     let mut post = PostFx::new(&ctx, &r);
+    // VF_BRUSHTEST=size: one brush carve where the camera looks (+ VF_UNDO=1: undone again).
+    if let Some(size) = std::env::var("VF_BRUSHTEST").ok().and_then(|v| v.parse::<i32>().ok()) {
+        cvars::R_BRUSH_SIZE.set(size);
+        let mut fluid = crate::fluid::FluidSim::default();
+        if let Some(t) = super::scene_edit::brush_target(&world, &objects, cam.pos, cam.forward()) {
+            let mut env = super::scene_edit::EditEnv { ctx: &ctx, r: &mut r, world: &mut world, objects: &mut objects, fluid: &mut fluid };
+            let rec = super::scene_edit::brush_edit(&mut env, &t, super::scene_edit::BrushOp::Carve, 0);
+            let mut undo = crate::edit::undo::UndoStack::default();
+            undo.push(rec);
+            if std::env::var("VF_UNDO").is_ok_and(|v| v == "1") {
+                let a = undo.undo(&mut world, &mut objects);
+                r.gpu.sync(&ctx, &mut world);
+                if a.bodies {
+                    r.gpu.init_objects(&ctx, &world, &mut objects);
+                    r.rebind_object_buffers();
+                }
+                log::info!(target: "brushtest", "undone: {} ({} bodies)", a.label, objects.len());
+            }
+        }
+    }
     // Headless edit self-tests (the interactive editor's sync path): VF_CARVETEST=radius carves
     // a sphere where the camera looks; VF_PLACETEST=material drops a ball ahead of it.
     if let Ok(v) = std::env::var("VF_CARVETEST") {
