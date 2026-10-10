@@ -1,8 +1,9 @@
 # VoxelForge (Rust)
 
-A GPU ray-traced voxel engine on Vulkan compute, rewritten in Rust from the C++ engine.
-1 voxel = 10 cm; a 2048 x 1024 x 2048 world of sparse 8³ bricks, traced per pixel on the GPU
-(brick grid + atlas + a coarse occupancy pyramid + a brick distance field), lit by either
+A GPU ray-traced voxel engine on Vulkan compute, rewritten in Rust from the C++ engine. 1 voxel
+= 10 cm; an endless world of sparse 8³ bricks streamed in 12.8 m chunks around you, traced per
+pixel on the GPU (brick grid + atlas + a coarse occupancy pyramid + a brick distance field),
+lit by either
 
 - **ray traced** lighting: traced sun + GI rays per pixel, denoised by an SVGF chain
   (temporal accumulation, à-trous wavelet filter, GI stabilisation), or
@@ -52,8 +53,9 @@ Standard lighting, N SVGF / raw, `[` `]` exposure.
 Every setting is a console variable (`src/cvars.rs`): `+set r.lighting standard`,
 `VF_SET="r.fog.density=2;r.clouds.coverage=0.7"`, or `settings.cfg` next to the game. `--shot`
 renders headless (no window) and writes a PNG; `VF_CAM="x,y,z,yaw,pitch"` places its camera.
-`--load <world>` starts in a save (a path, or a world's name in `saves/`), in the window or a
-shot.
+`+set world.endless 0` generates the fixed 2048 x 2048 world instead; `r.view.distance` (4-14
+chunks) sets how far the world streams. `--load <world>` starts in a save (a path, or a world's
+name in `saves/`), in the window or a shot.
 
 ## What changed from the C++ engine
 
@@ -69,6 +71,10 @@ shot.
 - **Faster saves**: the payload streams through the compressors in 4 MB chunks (a few chunks
   in memory instead of the whole 200 MB payload) at zlib level 2: a generated world saves in
   ~0.4 s instead of ~1.5 s, ~30 % larger, still readable by the C++ engine.
+- **Faster endless worlds**: stream workers share a terrain / plant context per 4 x 4 chunk tile
+  (built once, by whichever worker needs it first) instead of every chunk recomputing a 9x
+  apron: half the work per chunk, the same voxels. Chunks finished after the camera left them
+  skip the paste budget and go to the RAM cache (in C++ they held up the chunks still wanted).
 - **rayon** work-stealing replaces the hand-rolled job pool (chunk generation, the atlas
   packing, the light scan).
 - std140 / push-constant layouts are mirrored as `#[repr(C)]` structs with compile-time
@@ -87,12 +93,14 @@ felled-tree hinges; fixed 60 Hz with interpolated rendering), destruction (carve
 become bodies, a cut tree takes its own crown and topples toward the cut; bodies split), water
 flow (a volume-conserving cellular fluid: water falls, spreads, refills from its body's surface
 and drains lakes level), saves (the C++ engine's `.vfworld` format, v1-v6, written as v6; quick
-save / load with thumbnails).
+save / load with thumbnails), endless worlds (chunks streamed around the camera on worker
+threads with a RAM cache of the ones left behind, edited chunks in region files beside the
+save, a floating origin; an old fixed-size save converts, its land kept chunk for chunk).
 
-Not yet ported: generators 2 / 3, endless streaming (`StreamManager`, far horizon), region
-files, the undo stack and edit tools (shapes, lines, brush tools), the ImGui UI (menus, editor,
-map, inventory), audio, weather presets, mesh import, NVIDIA DLSS / NRD and hardware ray
-queries.
+Not yet ported: generators 2 / 3, the far horizon (land drawn past the view distance), the
+explored map, the undo stack and edit tools (shapes, lines, brush tools), the ImGui UI (menus,
+editor, map, inventory), audio, weather presets, mesh import, NVIDIA DLSS / NRD and hardware
+ray queries.
 
 ## Debugging
 

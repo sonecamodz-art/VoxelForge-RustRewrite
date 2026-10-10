@@ -27,7 +27,7 @@ use crate::gfx::renderer::Renderer;
 use crate::math::Vec3;
 use crate::objects::VoxObject;
 use crate::fluid::FluidSim;
-use crate::serialize::SceneState;
+use super::endless::{origin_for, Endless, ORIGIN_STEP};
 use super::saves;
 use crate::physics::{self, BodyState, Physics};
 use crate::player::{self as pl, Player, PlayerInput, PlayerTuning, PlayerWorld};
@@ -76,10 +76,12 @@ struct Game {
     fluid: FluidSim,
     fluid_dirty: bool,
     fluid_synced: Instant,
+    /// An endless world's streaming session (None: a fixed-size world).
+    endless: Option<Endless>,
 }
 
 /// What the loading worker hands over.
-type StartupWorld = (World, Vec<VoxObject>, Option<SceneState>);
+type StartupWorld = super::Startup;
 
 enum Phase {
     Loading { thread: Option<std::thread::JoinHandle<StartupWorld>>, progress: Arc<AtomicI32> },
@@ -260,6 +262,35 @@ fn tuning() -> PlayerTuning {
 }
 
 impl Game {
+    /// Endless worlds: the floating origin, the view distance, chunks in / out around the camera.
+    fn stream(&mut self, ctx: &Context) {
+        let Some(e) = self.endless.as_mut() else { return };
+        // Far out: move the origin (floats stay precise however far you travel).
+        let lim = 0.6 * ORIGIN_STEP as f32;
+        if self.cam.pos.x.abs() > lim || self.cam.pos.z.abs() > lim {
+            let (dx, dz) = (origin_for(self.cam.pos.x), origin_for(self.cam.pos.z));
+            e.rebase(&mut self.world, dx, dz);
+            let d = Vec3::new(dx as f32, 0.0, dz as f32);
+            self.cam.pos -= d;
+            self.prev_cam.pos -= d;
+            self.player.feet -= d;
+            self.last_eye -= d;
+            for o in &mut self.objects {
+                o.shift_world(dx as f32, dz as f32);
+            }
+            for p in &mut self.phys_prev {
+                p.t -= d;
+            }
+            self.fluid.shift(dx, dz);
+            self.r.shift_origin(dx, dz);
+        }
+        if e.apply_view_distance(&mut self.world, self.cam.pos.x, self.cam.pos.z) {
+            self.r.gpu.stream_radius = e.stream.radius();
+            self.r.reload_scene(ctx, &mut self.world, &mut self.objects);
+        }
+        e.frame(ctx, &mut self.r, &mut self.world, self.cam.pos, self.cam.forward());
+    }
+
     fn notify(&mut self, msg: String) {
         log::info!(target: "app", "{msg}");
         self.notice = Some((msg, Instant::now()));
@@ -268,7 +299,7 @@ impl Game {
 
     /// F5 / F9.
     fn quick_save_load(&mut self, ctx: &Context, save: bool) {
-        let mut io = saves::WorldIo { ctx, r: &mut self.r, world: &mut self.world, objects: &mut self.objects, cam: &mut self.cam, fluid: &mut self.fluid };
+        let mut io = saves::WorldIo { ctx, r: &mut self.r, world: &mut self.world, objects: &mut self.objects, cam: &mut self.cam, fluid: &mut self.fluid, endless: &mut self.endless };
         let msg = if save {
             match saves::quick_save(&mut io) {
                 Ok(n) => format!("World saved: {n}"),
@@ -588,7 +619,7 @@ impl Running {
         // Loading: finish the world when the worker is done (then build the renderer).
         if let Phase::Loading { thread, progress } = &mut self.phase {
             if thread.as_ref().is_some_and(|t| t.is_finished()) {
-                let (mut world, mut objects, state) = thread.take().unwrap().join().expect("world generation panicked");
+                let super::Startup { mut world, mut objects, state, endless } = thread.take().unwrap().join().expect("world generation panicked");
                 let (rw, rh) = self.render_size();
                 let r = Renderer::new(&self.ctx, &mut world, &mut objects, rw, rh, rw, rh);
                 let post = PostFx::new(&self.ctx, &r);
@@ -625,6 +656,7 @@ impl Running {
                     phys_prev: Vec::new(),
                     phys_was_on: false,
                     fluid,
+                    endless,
                     fluid_dirty: false,
                     fluid_synced: now,
                 }));
@@ -675,6 +707,7 @@ impl Running {
             }
         }
         g.space_pressed = false;
+        g.stream(&self.ctx);
         let time = if cvars::R_TIME_FREEZE.get() { 0.0 } else { (now - g.start).as_secs_f32() % 3600.0 };
         if cvars::R_TIME_DAYLENGTH.get() > 0.0 {
             let h = (cvars::R_TIME_HOUR.get() + dt * 24.0 / (cvars::R_TIME_DAYLENGTH.get() * 60.0)) % 24.0;

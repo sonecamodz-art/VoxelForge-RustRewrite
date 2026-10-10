@@ -130,6 +130,7 @@ pub struct WorldIo<'a> {
     pub objects: &'a mut Vec<VoxObject>,
     pub cam: &'a mut FlyCamera,
     pub fluid: &'a mut FluidSim,
+    pub endless: &'a mut Option<super::endless::Endless>,
 }
 
 /// The rendered scene (no UI), cropped to 16:9 and box-filtered to the thumbnail (top-down).
@@ -189,7 +190,7 @@ pub fn save_world(io: &mut WorldIo, name: &str) -> Result<String, String> {
         thumb,
     };
     // Saves hold absolute coordinates (an endless world's floating origin added back).
-    let (ox, oz) = if io.world.ring_w != 0 { (io.world.origin_x, io.world.origin_z) } else { (0, 0) };
+    let (ox, oz) = io.endless.as_ref().map_or((0, 0), |e| e.origin());
     let mut st = SceneState {
         has_camera: true,
         cam_pos: [io.cam.pos.x + ox as f32, io.cam.pos.y, io.cam.pos.z + oz as f32],
@@ -215,7 +216,12 @@ pub fn save_world(io: &mut WorldIo, name: &str) -> Result<String, String> {
         io.objects
     };
     let path = save_path_for(&name);
-    serialize::save_scene(&path, io.world, bodies, &SaveParts { info: Some(&info), state: Some(&st), ..Default::default() }).map_err(|e| e.to_string())?;
+    // An endless world: its edited chunks into the region files beside the save first.
+    if let Some(e) = io.endless.as_mut() {
+        e.flush(io.world, &super::endless::chunk_dir_for(&path)).map_err(|e| format!("the chunks couldn't be written: {e}"))?;
+    }
+    let parts = SaveParts { info: Some(&info), state: Some(&st), endless: io.endless.as_ref().map(|e| &e.info), ..Default::default() };
+    serialize::save_scene(&path, io.world, bodies, &parts).map_err(|e| e.to_string())?;
     set_current_world_name(&name);
     log::info!(target: "saves", "saved {} ({} bodies, {} water cells) in {:.0} ms", path.display(), io.objects.len(), st.water.len(),
                t0.elapsed().as_secs_f64() * 1e3);
@@ -223,20 +229,21 @@ pub fn save_world(io: &mut WorldIo, name: &str) -> Result<String, String> {
 }
 
 /// Load a save over the current world (GPU state, water, world cvars and the camera with it).
-/// Nothing changes if it fails. Returns the world's name (its file's: a copied save keeps
-/// its old name inside).
+/// Nothing changes if it fails. Returns the world's name (its file's: a copied save keeps its
+/// old name inside).
 pub fn load_world(io: &mut WorldIo, path: &Path) -> Result<String, String> {
-    let t0 = Instant::now();
-    let loaded = serialize::load_scene(path).map_err(|e| e.to_string())?;
-    if loaded.volume.is_none() {
-        return Err("it's an endless world (streaming isn't in this build yet)".into());
-    }
-    let (_, st, _) = loaded.apply(io.world, io.objects);
+    let s = super::world_from_save(path)?;
+    *io.endless = None; // (the old session's workers stop)
+    *io.world = s.world;
+    *io.objects = s.objects;
+    *io.endless = s.endless;
+    io.r.gpu.stream_radius = io.endless.as_ref().map_or(0, |e| e.stream.radius());
     io.r.reload_scene(io.ctx, io.world, io.objects);
-    restore_state(&st, io.fluid, io.cam);
+    if let Some(st) = &s.state {
+        restore_state(st, io.fluid, io.cam);
+    }
     let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     set_current_world_name(&name);
-    log::info!(target: "saves", "loaded {} ({} bodies) in {:.0} ms", path.display(), io.objects.len(), t0.elapsed().as_secs_f64() * 1e3);
     Ok(name)
 }
 

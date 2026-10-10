@@ -1038,6 +1038,10 @@ mod tests {
         let l = load_scene(&path).unwrap();
         assert!(l.volume.is_none());
         assert_eq!(l.endless, en);
+        // A generated world's header (the defaults) loads too.
+        let generated = EndlessInfo { endless: true, seed: 5, ..Default::default() };
+        save_scene(&path, &w, &[], &SaveParts { endless: Some(&generated), ..Default::default() }).unwrap();
+        assert_eq!(load_scene(&path).unwrap().endless, generated);
         let mut c = SparseVolume::new(128, 64, 128);
         c.fill_box(0, 0, 0, 127, 10, 127, 3);
         c.set_voxel(7, 40, 9, 12);

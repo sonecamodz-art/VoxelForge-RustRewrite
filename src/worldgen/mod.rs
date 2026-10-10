@@ -673,9 +673,75 @@ pub fn generate_chunk(seed: u32, nx: i32, ny: i32, nz: i32, cx: i32, cz: i32) ->
     build_chunk(&ctx, cx, cz)
 }
 
+/// A generation context shared by a block of chunks (streaming builds one per tile: the
+/// terrain and plant recipes around the tile once, instead of per chunk with a 9x-area apron).
+pub struct RegionGen {
+    ctx: Context,
+    lo: (i32, i32),
+    hi: (i32, i32),
+}
+
+/// The context for chunks [cx0, cx1] x [cz0, cz1] of an nx x ny x nz world (nx = nz = 0:
+/// unbounded). Chunks built from it equal `generate_chunk`'s.
+pub fn region_context(seed: u32, nx: i32, ny: i32, nz: i32, (cx0, cz0): (i32, i32), (cx1, cz1): (i32, i32)) -> RegionGen {
+    let mut t = Terrain::new(seed, nx, ny, nz);
+    let (x0, z0, x1, z1) = (cx0 * CHUNK, cz0 * CHUNK, (cx1 + 1) * CHUNK - 1, (cz1 + 1) * CHUNK - 1);
+    let apron = PLANT_REACH + 8;
+    t.cache(x0 - apron, z0 - apron, x1 + apron, z1 + apron, false);
+    RegionGen { ctx: build_context(t, x0, z0, x1, z1, false), lo: (cx0, cz0), hi: (cx1, cz1) }
+}
+
+impl RegionGen {
+    pub fn contains(&self, cx: i32, cz: i32) -> bool {
+        (self.lo.0..=self.hi.0).contains(&cx) && (self.lo.1..=self.hi.1).contains(&cz)
+    }
+    /// One chunk of the region (single-threaded; workers share the context).
+    pub fn chunk(&self, cx: i32, cz: i32) -> SparseVolume {
+        debug_assert!(self.contains(cx, cz));
+        build_chunk(&self.ctx, cx, cz)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn region_chunks_match_standalone_ones() {
+        let r = region_context(7, 0, 512, 0, (-1, 3), (0, 4));
+        for (cx, cz) in [(-1, 3), (0, 4)] {
+            let a = r.chunk(cx, cz);
+            let b = generate_chunk(7, 0, 512, 0, cx, cz);
+            for z in (0..128).step_by(5) {
+                for y in (100..400).step_by(3) {
+                    for x in (0..128).step_by(5) {
+                        assert_eq!(a.get_voxel(x, y, z), b.get_voxel(x, y, z), "chunk {cx},{cz} at {x},{y},{z}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_region_vs_chunk() {
+        let t = Instant::now();
+        for i in 0..4 {
+            generate_chunk(1337, 0, 1024, 0, 20 + i, 30);
+        }
+        println!("BENCH standalone {:.0} ms/chunk", t.elapsed().as_secs_f64() * 1e3 / 4.0);
+        for n in [2, 3, 4] {
+            let t = Instant::now();
+            let r = region_context(1337, 0, 1024, 0, (20, 30), (19 + n, 29 + n));
+            let tc = t.elapsed().as_secs_f64() * 1e3;
+            for j in 0..n {
+                for i in 0..n {
+                    r.chunk(20 + i, 30 + j);
+                }
+            }
+            println!("BENCH tile {n}x{n}: context {tc:.0} ms, {:.0} ms/chunk all in", t.elapsed().as_secs_f64() * 1e3 / (n * n) as f64);
+        }
+    }
 
     #[test]
     fn chunk_matches_world() {

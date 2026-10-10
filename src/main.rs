@@ -21,7 +21,9 @@ mod objects;
 mod paths;
 mod physics;
 mod player;
+mod region_file;
 mod serialize;
+mod stream;
 mod voxel;
 mod worldgen;
 

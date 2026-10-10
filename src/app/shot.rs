@@ -98,13 +98,18 @@ pub fn write_png(path: &str, w: u32, h: u32, rgba: &[u8], bottom_up: bool) -> st
 pub fn run_shot(a: &ShotArgs) -> i32 {
     let (mut ctx, _) = Context::new(&[], a.validation, None);
     let t0 = std::time::Instant::now();
-    let (mut world, mut objects, state) = super::startup_world(a.load.as_deref(), None);
-    log::info!(target: "shot", "scene ready in {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
+    let super::Startup { mut world, mut objects, state, mut endless } = super::startup_world(a.load.as_deref(), None);
     let mut cam = default_camera(&world);
     if let Some(st) = &state {
         super::saves::restore_state(st, &mut crate::fluid::FluidSim::default(), &mut cam);
         apply_cam_env(&mut cam, "VF_CAM");
     }
+    if let Some(e) = endless.as_mut() {
+        // A shot: everything the view distance holds, before the first frame.
+        let r = e.stream.radius();
+        e.stream.load_now(&mut world, cam.pos.x, cam.pos.z, r, &mut Vec::new(), &mut Vec::new());
+    }
+    log::info!(target: "shot", "scene ready in {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
     let mut r = Renderer::new(&ctx, &mut world, &mut objects, a.w, a.h, a.w, a.h);
     let mut post = PostFx::new(&ctx, &r);
     // Headless edit self-tests (the interactive editor's sync path): VF_CARVETEST=radius carves
@@ -250,7 +255,7 @@ pub fn run_shot(a: &ShotArgs) -> i32 {
     if let Ok(name) = std::env::var("VF_SAVETEST") {
         let mut cam = cam;
         let mut fluid = crate::fluid::FluidSim::default();
-        let mut io = super::saves::WorldIo { ctx: &ctx, r: &mut r, world: &mut world, objects: &mut objects, cam: &mut cam, fluid: &mut fluid };
+        let mut io = super::saves::WorldIo { ctx: &ctx, r: &mut r, world: &mut world, objects: &mut objects, cam: &mut cam, fluid: &mut fluid, endless: &mut endless };
         saved = super::saves::save_world(&mut io, &name).map(|_| ());
         if let Err(e) = &saved {
             log::error!(target: "shot", "saving {name}: {e}");

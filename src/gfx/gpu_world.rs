@@ -225,8 +225,9 @@ impl GpuWorld {
         self.wby = world.bricks_y;
         self.wbz = world.bricks_z;
         self.ring_mode = world.ring_w > 0;
+        // The atlas holds what the view distance keeps resident (set by the endless session).
         if self.stream_radius == 0 {
-            self.stream_radius = 10;
+            self.stream_radius = crate::cvars::R_VIEW_DISTANCE.get();
         }
         // Atlas depth: detailed bricks (world + bodies) x 1.6 for edits; streaming: what the
         // radius keeps resident (~2000 bricks a chunk) + 10 %.

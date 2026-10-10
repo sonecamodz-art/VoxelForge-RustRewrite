@@ -318,11 +318,18 @@ pub struct FlatLayer {
     pub mat: u8,
     pub thickness: i32,
 }
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FlatWorld {
     pub layers: Vec<FlatLayer>,
+    /// The surface (the top of the last layer).
     pub height: i32,
     pub water: i32,
+}
+
+impl Default for FlatWorld {
+    fn default() -> Self {
+        Self { layers: Vec::new(), height: 64, water: 0 }
+    }
 }
 
 pub struct World {

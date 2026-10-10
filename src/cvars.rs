@@ -25,6 +25,12 @@ cvars! {
     APP_SCRIPT: Str = Str::new("app.script", "", "console commands run when the window loop starts ('|' separates; `after N cmd` delays)", &[]);
     WORLD_GEN: Int = Int::new("world.gen", 1, "terrain generator for new worlds (1 = original hills)", 1, 1);
     WORLD_SEED: Int = Int::new("world.seed", 1337, "seed of the startup world", 0, IMAX);
+    WORLD_ENDLESS: Bool = Bool::new("world.endless", true, "new worlds stream endlessly around you (0 = the fixed 2048 x 2048 world)");
+    R_VIEW_DISTANCE: Int = Int::new("r.view.distance", 10, "endless worlds: chunks (12.8 m) kept loaded around you", 4, 14);
+    STREAM_CACHE: Int = Int::new("stream.cache", 256, "endless worlds: MB of RAM keeping chunks you left (walking back needs no re-generation)", 0, 4096);
+    STREAM_BUDGET: Float = Float::new("stream.budget", 2.0, "endless worlds: ms per frame spent adding finished chunks", 0.2, 20.0);
+    STREAM_PER_FRAME: Int = Int::new("stream.perframe", 1, "endless worlds: chunks added (and uploaded) per frame; 3 while finished ones pile up", 1, 64);
+    R_HORIZON_FADE: Float = Float::new("r.horizon.fade", 0.5, "endless worlds: seconds a chunk streaming in at the edge fades in (0 = pop in)", 0.0, 3.0);
     R_EXPOSURE: Float = Float::new("r.exposure", 0.8, "manual exposure ([ and ] keys)", 0.05, 4.0);
     R_PRESENT: Str = Str::new("r.present", "fifo", "present mode: fifo = v-sync, mailbox = low latency, immediate = uncapped (V)",
                               &["fifo", "mailbox", "immediate"]);
