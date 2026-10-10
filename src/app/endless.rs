@@ -17,6 +17,7 @@ use rayon::prelude::*;
 use crate::cvars;
 use crate::gfx::context::Context;
 use crate::gfx::renderer::Renderer;
+use crate::horizon::{HorizonGen, Tile, LEVELS, TEXEL};
 use crate::region_file::ChunkStore;
 use crate::serialize::{encode_chunk, EndlessInfo};
 use crate::stream::{ChunkKey, ChunkSource, StreamManager, StreamParams, CHUNK_VOX};
@@ -49,6 +50,10 @@ pub struct Endless {
     pub stream: StreamManager,
     pub store: Arc<ChunkStore>,
     pub info: EndlessInfo,
+    /// The land beyond the loaded chunks, drawn to the horizon.
+    pub horizon: HorizonGen,
+    /// A new world: the GPU clipmap (another world's) is cleared first.
+    horizon_fresh: bool,
     /// Per ring slot: when its chunk began fading in (None = shown).
     fade_start: Vec<Option<Instant>>,
     stats: Stats,
@@ -100,7 +105,10 @@ impl Endless {
         stream.load_now(world, x - ox as f32, z - oz as f32, r, &mut Vec::new(), &mut Vec::new());
         log::info!(target: "stream", "{} chunks around {x:.0}, {z:.0} in {:.0} ms ({:.0} ms a chunk on a worker)", world.ring_slots.iter().filter(|s| s.loaded).count(),
                    t0.elapsed().as_secs_f64() * 1e3, stream.avg_chunk_ms());
-        Self { stream, store, info, fade_start: Vec::new(), stats: Stats::default() }
+        let mut horizon = HorizonGen::default();
+        horizon.start(info.seed, info.ny, info.flat.then_some(&info.flat_cfg), &world.palette);
+        horizon.set_focus(x, z);
+        Self { stream, store, info, horizon, horizon_fresh: true, fade_start: Vec::new(), stats: Stats::default() }
     }
 
     /// The origin in voxels (absolute = engine + origin).
@@ -181,6 +189,7 @@ impl Endless {
         }
         let t2 = Instant::now();
         self.fade(world, r, cam_pos, &added, &removed);
+        self.update_horizon(ctx, r, cam_pos);
         let st = &mut self.stats;
         st.added += added.len();
         st.removed += removed.len();
@@ -196,6 +205,51 @@ impl Endless {
             }
             *st = Stats { since: Some(Instant::now()), ..Default::default() };
         }
+    }
+
+    /// The far horizon: recentre on the camera, upload what the workers finished.
+    fn update_horizon(&mut self, ctx: &Context, r: &mut Renderer, cam: crate::math::Vec3) {
+        let (ox, oz) = self.origin();
+        let mut up: Vec<Tile> = Vec::new();
+        if self.horizon_fresh {
+            // A new world: whatever the clipmap held is another world's.
+            for level in 0..LEVELS {
+                for tz in 0..crate::horizon::TILES {
+                    for tx in 0..crate::horizon::TILES {
+                        up.push(Tile { level, tx, tz, px: Vec::new() });
+                    }
+                }
+            }
+            self.horizon_fresh = false;
+        }
+        self.horizon.set_focus(cam.x + ox as f32, cam.z + oz as f32); // (absolute)
+        self.horizon.poll(&mut up);
+        // To the engine's texels (the origin is whole windows of every level).
+        let mut win = [0i32; 10];
+        for level in 0..LEVELS {
+            let w = self.horizon.win(level);
+            win[level * 2] = w[0] - ox / TEXEL[level];
+            win[level * 2 + 1] = w[1] - oz / TEXEL[level];
+        }
+        // The voxels are trusted inside ~a chunk short of the view distance (the rest may still
+        // be streaming in: the horizon covers it meanwhile).
+        let rin = ((self.stream.radius() - 1).max(0)) * CHUNK_VOX;
+        r.update_horizon(ctx, cvars::R_HORIZON.get(), win, rin, &up);
+    }
+
+    /// Shots: wait (up to `secs`) for the horizon tiles queued so far, uploading as they come.
+    pub fn settle_horizon(&mut self, ctx: &Context, r: &mut Renderer, cam: crate::math::Vec3, secs: f32) {
+        let t0 = Instant::now();
+        loop {
+            self.update_horizon(ctx, r, cam);
+            if self.horizon.pending() == 0 || t0.elapsed().as_secs_f32() > secs {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        self.update_horizon(ctx, r, cam); // (the last tiles in flight)
+        log::info!(target: "horizon", "settled in {:.1} s, {} tiles still queued", t0.elapsed().as_secs_f32(), self.horizon.pending());
     }
 
     /// Chunks streaming in near the edge of the view distance fade in instead of popping.

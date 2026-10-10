@@ -671,6 +671,96 @@ impl Renderer {
         self.gi_cache_clear = true;
     }
 
+    /// Endless worlds: the far horizon's state (on, each level's window in the engine's texels,
+    /// the radius inside which the voxels are trusted) and its finished / cleared tiles.
+    pub fn update_horizon(&mut self, ctx: &crate::gfx::context::Context, on: bool, win: [i32; 10], inner_radius: i32, tiles: &[crate::horizon::Tile]) {
+        use crate::gfx::context::{image_barrier, Access, Stage};
+        use crate::horizon::{N, TILE};
+        use ash::vk;
+        self.hor_on = on as i32;
+        self.hor_win = win;
+        self.hor_rin = inner_radius;
+        if tiles.is_empty() {
+            return;
+        }
+        // Tiles land at (texel & (N - 1)) of their level's band; a cleared tile copies zeros.
+        // Each texel is two words (ground, crowns); each tile also writes its 4 x 4 blocks'
+        // tallest tops (voxels + 1; 0 = not made), which the shader's horizon march skips by.
+        const B: i32 = 8; // texels per block side
+        let (bt, bn) = (TILE / B, N / B);
+        let top_of = |g: u32, c: u32| (((g & 0x3FFF) + 7) >> 3).max(c & 0x7FF) as i32;
+        let (mut data, mut blk): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
+        let (mut regions, mut bregions) = (Vec::new(), Vec::new());
+        let (mut zero_at, mut bzero_at) = (None, None);
+        for t in tiles {
+            let (at, bat) = if !t.px.is_empty() {
+                let (at, bat) = (data.len(), blk.len());
+                data.extend_from_slice(&t.px);
+                blk.resize(blk.len() + (bt * bt) as usize, 0);
+                for z in 0..TILE {
+                    for x in 0..TILE {
+                        let i = ((z * TILE + x) * 2) as usize;
+                        let top = top_of(t.px[i], t.px[i + 1]) + 1;
+                        self.hor_max_h = self.hor_max_h.max(top);
+                        let m = &mut blk[bat + ((z / B) * bt + x / B) as usize];
+                        *m = (*m).max(top as u32);
+                    }
+                }
+                (at, bat)
+            } else {
+                let at = *zero_at.get_or_insert_with(|| {
+                    data.resize(data.len() + (TILE * TILE * 2) as usize, 0);
+                    data.len() - (TILE * TILE * 2) as usize
+                });
+                let bat = *bzero_at.get_or_insert_with(|| {
+                    blk.resize(blk.len() + (bt * bt) as usize, 0);
+                    blk.len() - (bt * bt) as usize
+                });
+                (at, bat)
+            };
+            let level = t.level as i32;
+            regions.push(
+                vk::BufferImageCopy::default()
+                    .buffer_offset(at as u64 * 4)
+                    .image_subresource(crate::gfx::context::COLOR_LAYERS)
+                    .image_offset(vk::Offset3D { x: (t.tx * TILE) & (N - 1), y: ((t.tz * TILE) & (N - 1)) + level * N, z: 0 })
+                    .image_extent(vk::Extent3D { width: TILE as u32, height: TILE as u32, depth: 1 }),
+            );
+            bregions.push(
+                vk::BufferImageCopy::default()
+                    .buffer_offset(bat as u64 * 4)
+                    .image_subresource(crate::gfx::context::COLOR_LAYERS)
+                    .image_offset(vk::Offset3D { x: (t.tx * bt) & (bn - 1), y: ((t.tz * bt) & (bn - 1)) + level * bn, z: 0 })
+                    .image_extent(vk::Extent3D { width: bt as u32, height: bt as u32, depth: 1 }),
+            );
+        }
+        self.gpu.retire_syncs(ctx, false);
+        let (b, off) = self.gpu.stage(ctx, bytemuck::cast_slice(&data));
+        let (bb, boff) = self.gpu.stage(ctx, bytemuck::cast_slice(&blk));
+        for r in &mut regions {
+            r.buffer_offset += off;
+        }
+        for r in &mut bregions {
+            r.buffer_offset += boff;
+        }
+        let cb = self.gpu.begin_sync(ctx);
+        let dev = &ctx.device;
+        let (hor, hblk) = (self.fx.horizon.image, self.fx.hor_blk.image);
+        for im in [hor, hblk] {
+            image_barrier(dev, cb, im, Stage::COMPUTE_SHADER, Access::SHADER_SAMPLED_READ, Stage::COPY, Access::TRANSFER_WRITE, vk::ImageLayout::GENERAL,
+                          vk::ImageLayout::GENERAL);
+        }
+        unsafe {
+            dev.cmd_copy_buffer_to_image(cb, b, hor, vk::ImageLayout::GENERAL, &regions);
+            dev.cmd_copy_buffer_to_image(cb, bb, hblk, vk::ImageLayout::GENERAL, &bregions);
+        }
+        for im in [hor, hblk] {
+            image_barrier(dev, cb, im, Stage::COPY, Access::TRANSFER_WRITE, Stage::COMPUTE_SHADER, Access::SHADER_SAMPLED_READ, vk::ImageLayout::GENERAL,
+                          vk::ImageLayout::GENERAL);
+        }
+        self.gpu.submit_sync(ctx, cb);
+    }
+
     /// Endless worlds: per ring slot, how much of its fade-in is still to go.
     pub fn set_chunk_fade(&mut self, per_slot: &[u8]) {
         self.chunk_fade = [0; 256];

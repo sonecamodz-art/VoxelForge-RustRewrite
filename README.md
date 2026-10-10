@@ -95,12 +95,12 @@ flow (a volume-conserving cellular fluid: water falls, spreads, refills from its
 and drains lakes level), saves (the C++ engine's `.vfworld` format, v1-v6, written as v6; quick
 save / load with thumbnails), endless worlds (chunks streamed around the camera on worker
 threads with a RAM cache of the ones left behind, edited chunks in region files beside the
-save, a floating origin; an old fixed-size save converts, its land kept chunk for chunk).
+save, a floating origin; an old fixed-size save converts, its land kept chunk for chunk), the
+far horizon (a 5-level clipmap of the generator's terrain, lakes and tree crowns, ~6 km).
 
-Not yet ported: generators 2 / 3, the far horizon (land drawn past the view distance), the
-explored map, the undo stack and edit tools (shapes, lines, brush tools), the ImGui UI (menus,
-editor, map, inventory), audio, weather presets, mesh import, NVIDIA DLSS / NRD and hardware
-ray queries.
+Not yet ported: generators 2 / 3, the explored map, the undo stack and edit tools (shapes,
+lines, brush tools), the ImGui UI (menus, editor, map, inventory), audio, weather presets, mesh
+import, NVIDIA DLSS / NRD and hardware ray queries.
 
 ## Debugging
 

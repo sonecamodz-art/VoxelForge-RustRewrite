@@ -111,6 +111,11 @@ pub fn run_shot(a: &ShotArgs) -> i32 {
     }
     log::info!(target: "shot", "scene ready in {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
     let mut r = Renderer::new(&ctx, &mut world, &mut objects, a.w, a.h, a.w, a.h);
+    if let Some(e) = endless.as_mut() {
+        // The far horizon before the first frame (VF_HORIZON_WAIT seconds at most, default 120).
+        let secs = std::env::var("VF_HORIZON_WAIT").ok().and_then(|v| v.parse().ok()).unwrap_or(120.0);
+        e.settle_horizon(&ctx, &mut r, cam.pos, secs);
+    }
     let mut post = PostFx::new(&ctx, &r);
     // Headless edit self-tests (the interactive editor's sync path): VF_CARVETEST=radius carves
     // a sphere where the camera looks; VF_PLACETEST=material drops a ball ahead of it.

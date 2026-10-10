@@ -14,6 +14,7 @@ mod destruction;
 mod fluid;
 mod gfx;
 mod hash;
+mod horizon;
 mod lights;
 mod log;
 mod math;

@@ -30,6 +30,7 @@ cvars! {
     STREAM_CACHE: Int = Int::new("stream.cache", 256, "endless worlds: MB of RAM keeping chunks you left (walking back needs no re-generation)", 0, 4096);
     STREAM_BUDGET: Float = Float::new("stream.budget", 2.0, "endless worlds: ms per frame spent adding finished chunks", 0.2, 20.0);
     STREAM_PER_FRAME: Int = Int::new("stream.perframe", 1, "endless worlds: chunks added (and uploaded) per frame; 3 while finished ones pile up", 1, 64);
+    R_HORIZON: Bool = Bool::new("r.horizon", true, "endless worlds: the land beyond the loaded chunks, to ~3 km (far horizon)");
     R_HORIZON_FADE: Float = Float::new("r.horizon.fade", 0.5, "endless worlds: seconds a chunk streaming in at the edge fades in (0 = pop in)", 0.0, 3.0);
     R_EXPOSURE: Float = Float::new("r.exposure", 0.8, "manual exposure ([ and ] keys)", 0.05, 4.0);
     R_PRESENT: Str = Str::new("r.present", "fifo", "present mode: fifo = v-sync, mailbox = low latency, immediate = uncapped (V)",
