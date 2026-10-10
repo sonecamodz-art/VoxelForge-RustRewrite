@@ -4,6 +4,7 @@ pub mod saves;
 pub mod scene_edit;
 pub mod shot;
 pub mod swapchain;
+pub mod ui;
 pub mod window;
 
 use std::path::Path;

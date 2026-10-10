@@ -38,7 +38,9 @@ cvars! {
     R_SCALE: Float = Float::new("r.scale", 1.0, "render scale (F6 cycles 1/0.75/0.6/0.5); the blit upscales", 0.25, 1.0);
     R_DENOISER: Str = Str::new("r.denoiser", "svgf", "svgf = in-house SVGF chain, none = raw 1-spp radiance (N cycles)",
                                &["svgf", "none"]);
-    UI_OVERLAY: Bool = Bool::new("ui.overlay", false, "performance overlay in the window title (F3)");
+    UI_OVERLAY: Bool = Bool::new("ui.overlay", false, "performance overlay: every render pass, the camera position");
+    UI_FPS: Bool = Bool::new("ui.fps", false, "frame rate and frame time in the top-right corner (F3)");
+    UI_CROSSHAIR: Bool = Bool::new("ui.crosshair", true, "the mark in the middle of the screen");
     IN_SENSITIVITY: Float = Float::new("in.sensitivity", 1.0, "mouse sensitivity (1 = default)", 0.1, 4.0);
     IN_INVERT_Y: Bool = Bool::new("in.invertY", false, "invert the mouse's vertical axis");
     IN_FLYSPEED: Float = Float::new("in.flyspeed", 80.0, "flying speed, voxels per second (wheel changes it)", 5.0, 800.0);

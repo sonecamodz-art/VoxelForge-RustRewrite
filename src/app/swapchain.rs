@@ -9,6 +9,8 @@ pub struct Swapchain {
     pub format: vk::Format,
     pub extent: vk::Extent2D,
     pub images: Vec<vk::Image>,
+    /// One per image (the UI draws onto it).
+    pub views: Vec<vk::ImageView>,
     /// One per swapchain image (presentation waits on it).
     pub render_finished: Vec<vk::Semaphore>,
     /// The previous swapchain's semaphores: a present may still wait on them.
@@ -25,6 +27,7 @@ impl Swapchain {
             format: vk::Format::UNDEFINED,
             extent: vk::Extent2D::default(),
             images: Vec::new(),
+            views: Vec::new(),
             render_finished: Vec::new(),
             retired: Vec::new(),
             present_mode: mode,
@@ -88,6 +91,19 @@ impl Swapchain {
         self.format = chosen.format;
         self.extent = extent;
         self.images = vkc(unsafe { sw.get_swapchain_images(self.handle) }, "swapchain images");
+        self.destroy_views(ctx);
+        self.views = self
+            .images
+            .iter()
+            .map(|&im| {
+                let ci = vk::ImageViewCreateInfo::default()
+                    .image(im)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(chosen.format)
+                    .subresource_range(crate::gfx::context::COLOR_RANGE);
+                vkc(unsafe { ctx.device.create_image_view(&ci, None) }, "swapchain view")
+            })
+            .collect();
         self.render_finished = self.images.iter().map(|_| ctx.create_semaphore()).collect();
     }
 
@@ -101,7 +117,14 @@ impl Swapchain {
         self.create(ctx, surface, want);
     }
 
+    fn destroy_views(&mut self, ctx: &Context) {
+        for v in self.views.drain(..) {
+            unsafe { ctx.device.destroy_image_view(v, None) };
+        }
+    }
+
     pub fn destroy(&mut self, ctx: &Context) {
+        self.destroy_views(ctx);
         unsafe {
             for s in self.render_finished.drain(..).chain(self.retired.drain(..)) {
                 ctx.device.destroy_semaphore(s, None);

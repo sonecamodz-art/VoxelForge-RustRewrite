@@ -43,14 +43,14 @@ voxelforge [--winsize WxH] [--validation] [--load <world>] [+set <cvar> <value>]
            [--shot out.png [--frames N] [--dump final|albedo|normal|motion]]
 ```
 
-Window keys: click to capture the mouse (Esc frees it, Esc again quits), WASD to walk (Shift
-sprint, Ctrl / C crouch, Space jump, double-tap Space to fly / land; flying: Space / Ctrl up /
-down, wheel = speed), Tab toggles the free camera (no collision), F build mode: LMB carve / RMB
-place with the brush (held: repeats; `-` / `=` size, B sphere / cube, 1-9 material, MMB picks
-the block you aim at; the preview shows the voxels it will change), Ctrl+Z / Ctrl+Y undo /
-redo, F3 stats in the title, F4 debug views, F6 render scale, F10 reload shaders, F5 / F9 quick
-save / load, F11 fullscreen, P pause physics, L ray traced / Standard lighting, N SVGF / raw,
-`[` `]` exposure.
+Window keys: click to capture the mouse, Esc opens the menu (resume, save, load, options,
+quit), WASD to walk (Shift sprint, Ctrl / C crouch, Space jump, double-tap Space to fly / land;
+flying: Space / Ctrl up / down, wheel = speed), Tab toggles the free camera (no collision), F
+build mode: LMB carve / RMB place with the brush (held: repeats; `-` / `=` size, B sphere /
+cube, 1-9 material, MMB picks the block you aim at; the preview shows the voxels it will
+change), Ctrl+Z / Ctrl+Y undo / redo, F3 stats in the title, F4 debug views, F6 render scale,
+F10 reload shaders, F5 / F9 quick save / load, F11 fullscreen, P pause physics, L ray traced /
+Standard lighting, N SVGF / raw, `[` `]` exposure.
 
 Every setting is a console variable (`src/cvars.rs`): `+set r.lighting standard`,
 `VF_SET="r.fog.density=2;r.clouds.coverage=0.7"`, or `settings.cfg` next to the game. `--shot`
@@ -77,6 +77,8 @@ name in `saves/`), in the window or a shot.
   (built once, by whichever worker needs it first) instead of every chunk recomputing a 9x
   apron: half the work per chunk, the same voxels. Chunks finished after the camera left them
   skip the paste budget and go to the RAM cache (in C++ they held up the chunks still wanted).
+- **egui** instead of Dear ImGui for the UI: pure Rust, drawn on the swapchain image with
+  dynamic rendering; the Options rows bind to cvars by name.
 - **rayon** work-stealing replaces the hand-rolled job pool (chunk generation, the atlas
   packing, the light scan).
 - std140 / push-constant layouts are mirrored as `#[repr(C)]` structs with compile-time
@@ -96,14 +98,16 @@ hinges; fixed 60 Hz with interpolated rendering), destruction (carved-loose piec
 bodies, a cut tree takes its own crown and topples toward the cut; bodies split), water flow (a
 volume-conserving cellular fluid: water falls, spreads, refills from its body's surface and
 drains lakes level), saves (the C++ engine's `.vfworld` format, v1-v6, written as v6; quick
-save / load with thumbnails), endless worlds (chunks streamed around the camera on worker
-threads with a RAM cache of the ones left behind, edited chunks in region files beside the
-save, a floating origin; an old fixed-size save converts, its land kept chunk for chunk), the
-far horizon (a 5-level clipmap of the generator's terrain, lakes and tree crowns, ~6 km).
+save / load with thumbnails), the UI (egui: pause menu, Options pages bound to the cvars, save
+/ load screens with thumbnails, HUD, toasts, loading screen), endless worlds (chunks streamed
+around the camera on worker threads with a RAM cache of the ones left behind, edited chunks in
+region files beside the save, a floating origin; an old fixed-size save converts, its land kept
+chunk for chunk), the far horizon (a 5-level clipmap of the generator's terrain, lakes and tree
+crowns, ~6 km).
 
-Not yet ported: generators 2 / 3, the explored map, the shape / line / region tools, the ImGui
-UI (menus, editor, map, inventory), audio, weather presets, mesh import, NVIDIA DLSS / NRD and
-hardware ray queries.
+Not yet ported: generators 2 / 3, the explored map, the shape / line / region tools, the
+inventory, editor panels and map screens, audio, weather presets, mesh import, NVIDIA DLSS /
+NRD and hardware ray queries.
 
 ## Debugging
 

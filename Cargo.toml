@@ -8,6 +8,9 @@ description = "VoxelForge: a GPU ray-traced voxel engine (Vulkan compute), rewri
 ash = { version = "0.38", default-features = false, features = ["loaded", "debug", "std"] }
 ash-window = "0.13"
 bytemuck = { version = "1.25", features = ["derive"] }
+egui = "0.36"
+egui-ash-renderer = "0.13"
+egui-winit = { version = "0.36", default-features = false, features = ["clipboard", "wayland", "x11"] }
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 glam = "0.29"
 gpu-allocator = { version = "0.27", default-features = false, features = ["vulkan"] }

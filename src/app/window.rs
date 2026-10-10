@@ -29,6 +29,9 @@ use crate::objects::VoxObject;
 use crate::fluid::FluidSim;
 use super::endless::{origin_for, Endless, ORIGIN_STEP};
 use super::saves;
+use super::ui::hud::{self, HudInfo};
+use super::ui::menu::{Menu, MenuAction, Screen};
+use super::ui::{Gui, ToastKind};
 use super::scene_edit::{brush_edit, brush_preview_pc, brush_target, scene_raycast, BrushOp, BrushTarget, EditEnv, PREVIEW_CARVE, PREVIEW_PLACE};
 use crate::edit::undo::UndoStack;
 use crate::physics::{self, BodyState, Physics};
@@ -69,6 +72,8 @@ struct Game {
     target: Option<BrushTarget>,
     /// A status line shown in the title for a few seconds (saves, errors).
     notice: Option<(String, Instant)>,
+    /// Toasts for the UI (taken each frame).
+    toasts: Vec<(String, ToastKind)>,
     player: Player,
     /// Where the player put the eye last frame: anything else moving the camera hands it over.
     last_eye: Vec3,
@@ -111,6 +116,12 @@ struct Running {
     phase: Phase,
     /// Keyboard modifiers held (Ctrl+Z...).
     mods: winit::keyboard::ModifiersState,
+    /// The UI (dropped before the Vulkan context).
+    gui: Option<Gui>,
+    menu: Menu,
+    /// A menu choice, carried out at the start of the next frame (never while a frame's
+    /// commands still reference the world it would replace).
+    pending: Option<MenuAction>,
 }
 
 struct App {
@@ -171,6 +182,7 @@ impl ApplicationHandler for App {
         let acquire = [ctx.create_semaphore(), ctx.create_semaphore()];
         let fences = [ctx.create_fence(true), ctx.create_fence(true)];
         let cmds = [ctx.alloc_cmd(), ctx.alloc_cmd()];
+        let gui = Gui::new(&ctx, &window, sc.format);
         // The world generates (or loads) on a worker while the window shows progress.
         let progress = Arc::new(AtomicI32::new(0));
         let p2 = progress.clone();
@@ -187,12 +199,22 @@ impl ApplicationHandler for App {
             slot: 0,
             need_resize: false,
             mods: Default::default(),
+            gui: Some(gui),
+            menu: Menu::default(),
+            pending: None,
             phase: Phase::Loading { thread: Some(thread), progress },
         });
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, ev: WindowEvent) {
         let Some(run) = self.run.as_mut() else { return };
+        // The UI sees every event (it keeps its own input state); while the game has the mouse
+        // and no menu is open, the game gets them.
+        let ui_used = match run.gui.as_mut() {
+            Some(g) => g.on_event(&run.window, &ev),
+            None => false,
+        };
+        let ui_owns = run.menu.is_open() || (!run.captured() && ui_used);
         match ev {
             WindowEvent::CloseRequested => el.exit(),
             WindowEvent::Resized(_) => run.need_resize = true,
@@ -211,18 +233,25 @@ impl ApplicationHandler for App {
                 let PhysicalKey::Code(code) = event.physical_key else { return };
                 let down = event.state == ElementState::Pressed;
                 if down && !event.repeat && code == KeyCode::Escape {
-                    if run.captured() {
+                    // Esc: the pause menu; in a menu, back one level (closing it resumes).
+                    if run.menu.is_open() {
+                        if run.menu.back() {
+                            run.set_captured(true);
+                        }
+                    } else if matches!(run.phase, Phase::Game(_)) {
                         run.set_captured(false);
-                    } else {
-                        el.exit();
+                        run.menu.open(Screen::Pause);
                     }
+                    return;
+                }
+                if ui_owns {
                     return;
                 }
                 run.key(code, down, event.repeat);
             }
-            WindowEvent::MouseInput { state, button, .. } => run.mouse(button, state == ElementState::Pressed),
+            WindowEvent::MouseInput { state, button, .. } if !ui_owns => run.mouse(button, state == ElementState::Pressed),
             WindowEvent::ModifiersChanged(m) => run.mods = m.state(),
-            WindowEvent::MouseWheel { delta, .. } => {
+            WindowEvent::MouseWheel { delta, .. } if !ui_owns => {
                 let dy = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(p) => p.y as f32 / 40.0,
@@ -256,6 +285,14 @@ impl ApplicationHandler for App {
             run.destroy();
         }
     }
+}
+
+/// A save / load request.
+enum SaveLoad {
+    QuickSave,
+    QuickLoad,
+    SaveAs(String),
+    Load(std::path::PathBuf),
 }
 
 fn tuning() -> PlayerTuning {
@@ -376,20 +413,33 @@ impl Game {
 
     fn notify(&mut self, msg: String) {
         log::info!(target: "app", "{msg}");
+        let kind = if msg.starts_with("Couldn't") { ToastKind::Error } else if msg.starts_with("World saved") || msg.starts_with("Loaded") { ToastKind::Good } else { ToastKind::Info };
+        self.toasts.push((msg.clone(), kind));
         self.notice = Some((msg, Instant::now()));
         self.title_at = Instant::now() - std::time::Duration::from_secs(1); // refresh the title now
     }
 
     /// F5 / F9.
     fn quick_save_load(&mut self, ctx: &Context, save: bool) {
+        self.save_load(ctx, if save { SaveLoad::QuickSave } else { SaveLoad::QuickLoad });
+    }
+
+    fn save_load(&mut self, ctx: &Context, what: SaveLoad) {
         let mut io = saves::WorldIo { ctx, r: &mut self.r, world: &mut self.world, objects: &mut self.objects, cam: &mut self.cam, fluid: &mut self.fluid, endless: &mut self.endless };
-        let msg = if save {
-            match saves::quick_save(&mut io) {
+        let saving = matches!(what, SaveLoad::QuickSave | SaveLoad::SaveAs(_));
+        let res = match what {
+            SaveLoad::QuickSave => saves::quick_save(&mut io),
+            SaveLoad::SaveAs(name) => saves::save_world(&mut io, &name),
+            SaveLoad::QuickLoad => saves::quick_load(&mut io),
+            SaveLoad::Load(path) => saves::load_world(&mut io, &path),
+        };
+        let msg = if saving {
+            match res {
                 Ok(n) => format!("World saved: {n}"),
                 Err(e) => format!("Couldn't save: {e}"),
             }
         } else {
-            match saves::quick_load(&mut io) {
+            match res {
                 Ok(n) => {
                     // A new scene: no history to blend from, nothing to undo.
                     self.prev_cam = self.cam;
@@ -660,6 +710,29 @@ impl Running {
         // Wait for this slot's previous frame (its command buffer + per-slot resources).
         let slot = self.slot;
         self.ctx.wait_fence(self.fences[slot]);
+        if let Some(a) = self.pending.take() {
+            match a {
+                MenuAction::Quit => return false,
+                MenuAction::Resume => {
+                    self.menu.back();
+                    self.set_captured(true);
+                }
+                MenuAction::Save(name) => {
+                    if let Phase::Game(g) = &mut self.phase {
+                        g.save_load(&self.ctx, SaveLoad::SaveAs(name));
+                    }
+                    self.menu.screen = Screen::Closed;
+                    self.set_captured(true);
+                }
+                MenuAction::Load(path) => {
+                    if let Phase::Game(g) = &mut self.phase {
+                        g.save_load(&self.ctx, SaveLoad::Load(path));
+                    }
+                    self.menu.screen = Screen::Closed;
+                    self.set_captured(true);
+                }
+            }
+        }
         if self.need_resize {
             let sz = self.window.inner_size();
             if sz.width == 0 || sz.height == 0 {
@@ -709,6 +782,7 @@ impl Running {
                     repeat: 0.0,
                     target: None,
                     notice: None,
+                    toasts: Vec::new(),
                     player: Player::default(),
                     // Differs from the camera: the first frame places the player under it.
                     last_eye: cam.pos + Vec3::splat(1e6),
@@ -726,7 +800,7 @@ impl Running {
                 self.window.set_title("VoxelForge - click to look around, Esc to free the mouse");
             } else {
                 let p = progress.load(Ordering::Relaxed) as f32 / 1000.0;
-                return self.present_clear([0.05 + 0.15 * p, 0.08 + 0.25 * p, 0.12 + 0.4 * p, 1.0]);
+                return self.present_loading(if p > 0.0 { Some(p) } else { None });
             }
         }
         let Phase::Game(g) = &mut self.phase else { return true };
@@ -827,12 +901,45 @@ impl Running {
                                &blit, vk::Filter::LINEAR)
         };
         r.stamp(&rec, "blit");
-        image_barrier(&dev, cb, simg, Stage::BLIT, Access::TRANSFER_WRITE, Stage::BOTTOM_OF_PIPE, Access::NONE,
-                      vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR);
         r.out_to_general(&dev, cb);
+        // The UI over the frame (it leaves the image ready to present).
+        let gpu_ms: f32 = g.r.pass_ms.iter().map(|p| p.1).sum();
+        let held = g.world.palette[g.place_mat as usize];
+        let info = HudInfo {
+            frame_ms: g.frame_ms,
+            gpu_ms,
+            res: (g.r.w, g.r.h),
+            pos: g.cam.pos.to_array(),
+            passes: &g.r.pass_ms,
+            build: g.captured && cvars::R_BUILD.get(),
+            held: g.place_mat,
+            held_color: [held.r, held.g, held.b],
+            walking: cvars::IN_WALK.get(),
+            flying: g.player.flying,
+        };
+        let gui = self.gui.as_mut().unwrap();
+        for (t, k) in g.toasts.drain(..) {
+            gui.toasts.push(t, k, None);
+        }
+        let (menu, playing) = (&mut self.menu, g.captured);
+        let mut chosen = None;
+        gui.frame(&self.ctx, &self.window, cb, simg, self.sc.views[img as usize], e, slot, |c| {
+            if playing && !menu.is_open() {
+                if cvars::UI_CROSSHAIR.get() {
+                    hud::crosshair(c);
+                }
+                hud::draw(c, &info);
+            }
+            if let Some(a) = menu.draw(c) {
+                chosen = Some(a);
+            }
+        });
+        if chosen.is_some() {
+            self.pending = chosen;
+        }
         g.prev_cam = g.cam;
         g.frame += 1;
-        self.submit_present(cb, img, slot, Stage::BLIT);
+        self.submit_present(cb, img, slot, Stage::ALL_COMMANDS);
         self.slot ^= 1;
         self.update_title();
         if cvars::APP_FPSCAP.get() > 0 {
@@ -864,7 +971,38 @@ impl Running {
         }
     }
 
-    /// The loading screen: the whole window in one colour (brightening with progress).
+    /// The loading screen (the UI over a cleared image).
+    fn present_loading(&mut self, progress: Option<f32>) -> bool {
+        let slot = self.slot;
+        let sw = self.ctx.swapchain_fn.as_ref().unwrap();
+        let img = match unsafe { sw.acquire_next_image(self.sc.handle, u64::MAX, self.acquire[slot], vk::Fence::null()) } {
+            Ok((i, _)) => i,
+            Err(_) => {
+                self.need_resize = true;
+                return true;
+            }
+        };
+        let dev = self.ctx.device.clone();
+        vkc(unsafe { dev.reset_fences(&[self.fences[slot]]) }, "reset fence");
+        let cb = self.cmds[slot];
+        vkc(unsafe { dev.reset_command_buffer(cb, vk::CommandBufferResetFlags::empty()) }, "reset cmd");
+        self.ctx.begin_cmd(cb);
+        let simg = self.sc.images[img as usize];
+        image_barrier(&dev, cb, simg, Stage::TOP_OF_PIPE, Access::NONE, Stage::CLEAR, Access::TRANSFER_WRITE,
+                      vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+        unsafe { dev.cmd_clear_color_image(cb, simg, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &vk::ClearColorValue { float32: [0.047, 0.055, 0.07, 1.0] }, &[COLOR_RANGE]) };
+        image_barrier(&dev, cb, simg, Stage::CLEAR, Access::TRANSFER_WRITE, Stage::BLIT, Access::TRANSFER_WRITE,
+                      vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+        let what = if cvars::WORLD_ENDLESS.get() { "Loading the world around you" } else { "Generating the world" };
+        let gui = self.gui.as_mut().unwrap();
+        gui.frame(&self.ctx, &self.window, cb, simg, self.sc.views[img as usize], self.sc.extent, slot, |c| hud::loading(c, what, progress));
+        self.submit_present(cb, img, slot, Stage::ALL_COMMANDS);
+        self.slot ^= 1;
+        std::thread::sleep(std::time::Duration::from_millis(16));
+        true
+    }
+
+    /// The loading screen without a UI: the whole window in one colour.
     fn present_clear(&mut self, col: [f32; 4]) -> bool {
         let slot = self.slot;
         let sw = self.ctx.swapchain_fn.as_ref().unwrap();
@@ -928,6 +1066,7 @@ impl Running {
 
     fn destroy(&mut self) {
         self.ctx.wait_idle();
+        self.gui = None; // (its Vulkan objects go before the device)
         if let Phase::Game(g) = &mut self.phase {
             g.post.destroy(&self.ctx);
             g.r.destroy(&self.ctx);
